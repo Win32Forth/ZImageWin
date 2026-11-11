@@ -1,0 +1,11 @@
+build/
+.vs/
+*.user
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.res
+dist/*
+!dist/ZImager-1.0.0-arm64.exe
+!dist/ZImager-1.0.0-x64.exe
