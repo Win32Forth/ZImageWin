@@ -1730,10 +1730,25 @@ static void zi_merge_place(const ZiApp *app, int *ox, int *oy, double *scale, in
     *oy = (canvas_h - (int)(picture_h * *scale)) / 2 + g_merge_pan_y;
 }
 
+static void zi_merge_note(ZiApp *app, HDC hdc, const RECT *area, const wchar_t *text) {
+    HFONT old = (HFONT)SelectObject(hdc, app->font);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    DrawTextW(hdc, text, -1, (RECT *)area, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old);
+}
+
+int zi_merge_ready(void) {
+    return g_merge_left.b != NULL && g_merge_right.b != NULL;
+}
+
 void zi_merge_paint(ZiApp *app, HDC hdc) {
     ZiPix canvas;
     HBITMAP bitmap;
     RECT area;
+    RECT strip;
+    int bar;
     int w;
     int h;
     int ox;
@@ -1742,10 +1757,26 @@ void zi_merge_paint(ZiApp *app, HDC hdc) {
     HDC mem;
     HGDIOBJ old;
 
-    if (!app || !app->merge_open || !g_merge_left.b || !g_merge_right.b || !hdc) {
+    if (!app || !app->merge_open || !hdc) {
         return;
     }
     area = app->regions.canvas;
+    bar = zi_px(app, 44);
+    strip = area;
+    strip.bottom = strip.top + bar;
+    if (strip.bottom > area.bottom) {
+        strip.bottom = area.bottom;
+    }
+    FillRect(hdc, &strip, app->panel);
+    area.top = strip.bottom;
+    if (area.bottom <= area.top) {
+        return;
+    }
+    FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    if (!g_merge_left.b || !g_merge_right.b) {
+        zi_merge_note(app, hdc, &area, L"Reading the two photos.");
+        return;
+    }
     w = area.right - area.left;
     h = area.bottom - area.top;
     if (w < 8 || h < 8) {
@@ -1753,6 +1784,7 @@ void zi_merge_paint(ZiApp *app, HDC hdc) {
     }
     ZeroMemory(&canvas, sizeof canvas);
     if (!zi_compose(&g_merge_left, &g_merge_right, app->merge_vertical, app->merge_shift_x, app->merge_shift_y, &canvas)) {
+        zi_merge_note(app, hdc, &area, L"The photos could not be read.");
         return;
     }
     bitmap = zi_pix_bitmap(&canvas);
@@ -1813,6 +1845,10 @@ int zi_merge_pointer(ZiApp *app, int x, int y, int down, int alt, int space) {
     pt.y = y;
     if (!PtInRect(&app->regions.canvas, pt)) {
         return 0;
+    }
+    /* The Fit and 100% strip belongs to those buttons. */
+    if (y < app->regions.canvas.top + zi_px(app, 44) && !g_merge_drag) {
+        return down ? 1 : 0;
     }
     if (down && space) {
         g_merge_drag = 1;

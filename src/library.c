@@ -152,7 +152,15 @@ static int g_modal;
 static HWND g_event_edit;
 static HWND g_prefix_edit;
 static HWND g_date_edit;
+static HWND g_move_edit;
+static HWND g_filter_edit;
+static WNDPROC g_edit_proc;
 static HFONT g_edit_font;
+static wchar_t g_date_path[MAX_PATH];
+
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER (0x1500 + 1)
+#endif
 
 static ZiEvent g_events[ZI_LIB_CAP];
 static int g_event_count;
@@ -2280,10 +2288,74 @@ static int zi_collect_marks(const ZiApp *app, int clicked, int marks_only, ZiLib
     return n;
 }
 
+static int zi_field_on(const RECT *rc) {
+    return rc && rc->right > rc->left && rc->bottom > rc->top;
+}
+
+static void zi_sync_named_edit(HWND edit, const wchar_t *text) {
+    wchar_t now[ZI_NAME];
+
+    if (!edit || GetFocus() == edit) {
+        return;
+    }
+    GetWindowTextW(edit, now, ZI_NAME);
+    if (wcscmp(now, text ? text : L"") != 0) {
+        SetWindowTextW(edit, text ? text : L"");
+    }
+}
+
+static void zi_sync_date_edit(ZiApp *app) {
+    const ZiFile *file = NULL;
+    wchar_t text[40];
+    const wchar_t *capture;
+    int n;
+    int i;
+
+    if (!g_date_edit) {
+        return;
+    }
+    text[0] = L'\0';
+    if (app->file_selected >= 0 && app->file_selected < app->file_count) {
+        file = &app->files[app->file_selected];
+    }
+    if (!file) {
+        if (g_date_path[0]) {
+            g_date_path[0] = L'\0';
+            SetWindowTextW(g_date_edit, L"");
+        }
+        return;
+    }
+    if (wcscmp(g_date_path, file->path) == 0) {
+        return;
+    }
+    wcscpy_s(g_date_path, MAX_PATH, file->path);
+    capture = file->capture;
+    n = (int)wcslen(capture);
+    if (n == 4) {
+        int digits = 1;
+
+        for (i = 0; i < 4; i++) {
+            if (capture[i] < L'0' || capture[i] > L'9') {
+                digits = 0;
+            }
+        }
+        if (digits) {
+            wcscpy_s(text, 40, capture);
+        }
+    } else if (n >= 10 && capture[4] == L'-' && capture[7] == L'-') {
+        wcsncpy_s(text, 40, capture, 10);
+    } else if (n > 0) {
+        wcsncpy_s(text, 40, capture, _TRUNCATE);
+    }
+    SetWindowTextW(g_date_edit, text);
+}
+
 static void zi_show_edits(ZiApp *app) {
     int events = app->events_open;
     int reorg = app->reorg_open;
-    int date = zi_library_date_visible(app);
+    int date = zi_field_on(&app->date_field);
+    int move = zi_field_on(&app->move_field);
+    int filter = zi_field_on(&app->filter_field);
 
     if (g_event_edit) {
         ShowWindow(g_event_edit, events ? SW_SHOW : SW_HIDE);
@@ -2293,6 +2365,21 @@ static void zi_show_edits(ZiApp *app) {
     }
     if (g_date_edit) {
         ShowWindow(g_date_edit, date ? SW_SHOW : SW_HIDE);
+    }
+    if (g_move_edit) {
+        ShowWindow(g_move_edit, move ? SW_SHOW : SW_HIDE);
+    }
+    if (g_filter_edit) {
+        ShowWindow(g_filter_edit, filter ? SW_SHOW : SW_HIDE);
+    }
+    if (date) {
+        zi_sync_date_edit(app);
+    }
+    if (move) {
+        zi_sync_named_edit(g_move_edit, app->move_name);
+    }
+    if (filter) {
+        zi_sync_named_edit(g_filter_edit, app->name_filter);
     }
 }
 
@@ -2315,6 +2402,37 @@ static RECT zi_box(int x, int y, int w, int h) {
     rc.right = x + w;
     rc.bottom = y + h;
     return rc;
+}
+
+static void zi_read_edit(HWND edit, wchar_t *dest, size_t cap);
+
+static LRESULT CALLBACK zi_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_MOUSEWHEEL) {
+        return SendMessageW(GetParent(hwnd), msg, wparam, lparam);
+    }
+    if (msg == WM_KEYDOWN && wparam == VK_RETURN && hwnd == g_filter_edit) {
+        ZiApp *app = (ZiApp *)GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA);
+        wchar_t text[ZI_NAME];
+
+        if (app) {
+            zi_read_edit(hwnd, text, ZI_NAME);
+            zi_grid_set_filter(app, text);
+        }
+        return 0;
+    }
+    return CallWindowProcW(g_edit_proc, hwnd, msg, wparam, lparam);
+}
+
+static void zi_hook_edit(HWND edit) {
+    WNDPROC prior;
+
+    if (!edit) {
+        return;
+    }
+    prior = (WNDPROC)SetWindowLongPtrW(edit, GWLP_WNDPROC, (LONG_PTR)zi_edit_proc);
+    if (!g_edit_proc) {
+        g_edit_proc = prior;
+    }
 }
 
 static void zi_place_edit(HWND edit, HFONT font, RECT rc) {
@@ -2634,6 +2752,14 @@ void zi_library_startup(HWND hwnd) {
     g_event_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)4101, instance, NULL);
     g_prefix_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)4102, instance, NULL);
     g_date_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)4103, instance, NULL);
+    g_move_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)4104, instance, NULL);
+    g_filter_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)4105, instance, NULL);
+    SendMessageW(g_date_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"YYYY-MM-DD or year");
+    SendMessageW(g_move_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Folder");
+    SendMessageW(g_filter_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Name");
+    zi_hook_edit(g_date_edit);
+    zi_hook_edit(g_move_edit);
+    zi_hook_edit(g_filter_edit);
     ZeroMemory(&wc, sizeof wc);
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = instance;
@@ -2810,18 +2936,14 @@ void zi_library_layout(ZiApp *app) {
         x += zi_px(app, 92);
         zi_add_hit(ZI_HIT_CHOOSE, 0, !busy, zi_box(x, y, zi_px(app, 130), h), L"Choose Folder");
     }
-    if (zi_library_date_visible(app)) {
-        int movable = 0;
-        ZiLibItem *items = NULL;
-        int count = zi_collect_marks(app, -1, 0, &items);
-        RECT column = app->regions.right;
-
-        free(items);
-        movable = count > 0;
-        field = zi_box(column.left + pad, column.bottom - pad - h - gap - h, column.right - column.left - pad * 2, h);
-        zi_place_edit(g_date_edit, app->font, field);
-        zi_add_hit(ZI_HIT_DATE, 0, movable && !busy && !app->date_busy && !app->removal_busy && !app->clean_busy,
-                   zi_box(column.left + pad, column.bottom - pad - h, column.right - column.left - pad * 2, h), L"Set date");
+    if (zi_field_on(&app->date_field)) {
+        zi_place_edit(g_date_edit, app->font, app->date_field);
+    }
+    if (zi_field_on(&app->move_field)) {
+        zi_place_edit(g_move_edit, app->font, app->move_field);
+    }
+    if (zi_field_on(&app->filter_field)) {
+        zi_place_edit(g_filter_edit, app->font, app->filter_field);
     }
     if (app->source_server && zi_showing_folder(app) && app->library_section == 2 && !app->events_open && !app->reorg_open) {
         const wchar_t *pin_label = L"Pin";
@@ -3028,15 +3150,6 @@ void zi_library_paint_side(ZiApp *app, HDC hdc) {
             DrawTextW(hdc, g_dup_notice, -1, &text, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
         }
         SelectObject(hdc, old);
-    } else if (zi_library_date_visible(app)) {
-        RECT text = column;
-        text.left += pad;
-        text.right -= pad;
-        text.bottom = column.bottom - zi_px(app, 8);
-        text.top = text.bottom - zi_px(app, 110);
-        if (app->notice[0]) {
-            zi_paint_wrap(app, hdc, text, app->notice, ZI_INK);
-        }
     }
     for (i = 0; i < g_hit_count; i++) {
         if (g_hits[i].rc.left >= app->regions.right.left) {
@@ -3103,6 +3216,29 @@ static void zi_read_edit(HWND edit, wchar_t *dest, size_t cap) {
     }
     GetWindowTextW(edit, dest, (int)cap);
     zi_trim_text(dest);
+}
+
+void zi_library_read_move(ZiApp *app) {
+    wchar_t text[ZI_NAME];
+
+    if (!app) {
+        return;
+    }
+    zi_read_edit(g_move_edit, text, ZI_NAME);
+    wcscpy_s(app->move_name, ZI_NAME, text);
+}
+
+void zi_library_read_filter(wchar_t *dest, size_t cap) {
+    if (!dest || cap == 0) {
+        return;
+    }
+    zi_read_edit(g_filter_edit, dest, cap);
+}
+
+void zi_library_set_filter_text(const wchar_t *text) {
+    if (g_filter_edit) {
+        SetWindowTextW(g_filter_edit, text ? text : L"");
+    }
 }
 
 static void zi_choose_prefix(ZiApp *app) {
@@ -3685,7 +3821,7 @@ static void zi_click_rename(ZiApp *app) {
     zi_start(app, job);
 }
 
-static void zi_click_date(ZiApp *app) {
+void zi_library_apply_date(ZiApp *app) {
     wchar_t typed[80];
     char wire[80];
     ZiLibItem *items = NULL;
@@ -3975,7 +4111,7 @@ void zi_library_click(ZiApp *app, int id, int extra) {
         zi_choose_prefix(app);
         break;
     case ZI_HIT_DATE:
-        zi_click_date(app);
+        zi_library_apply_date(app);
         break;
     case ZI_HIT_FIND:
         zi_click_find(app);

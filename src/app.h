@@ -110,6 +110,9 @@ enum {
     ZI_ID_FOLD_MOVE,
     ZI_ID_FOLD_MERGE,
     ZI_ID_FOLD_BUILD,
+    ZI_ID_FOLD_PREVIEW,
+    ZI_ID_FOLD_PAGE,
+    ZI_ID_SET_DATE,
     ZI_ID_MOVE_NAME,
     ZI_ID_MERGE_FIT,
     ZI_ID_MERGE_FULL
@@ -137,6 +140,7 @@ enum {
     ZI_CMD_ROT_RIGHT,
     ZI_CMD_FLIP_H,
     ZI_CMD_FLIP_V,
+    ZI_CMD_ABOUT,
     ZI_CMD_CTX_EDIT = 2101,
     ZI_CMD_CTX_REVEAL,
     ZI_CMD_CTX_OPEN,
@@ -304,6 +308,8 @@ typedef struct ZiApp {
     wchar_t library_root[MAX_PATH];
     wchar_t library_scan[MAX_PATH];
     wchar_t notice[192];
+    /* Build previews panel status. Separate from the grid notice. */
+    wchar_t build_note[192];
     wchar_t helper_host[64];
     wchar_t helper_line[192];
     /* Mac DuplicateCopy.passLine. Empty hides the toolbar status. */
@@ -445,10 +451,20 @@ typedef struct ZiApp {
     int file_match_total;
     int file_video_total;
     int file_filtered;
+    int fold_preview;
+    int fold_page;
     int fold_date;
     int fold_move;
     int fold_merge;
     int fold_build;
+    /* Right folder column. Independent of the sidebar folder_scroll. */
+    int detail_scroll;
+    int detail_content;
+    RECT date_field;
+    RECT move_field;
+    RECT filter_field;
+    RECT preview_well;
+    RECT facts_rc;
     int flatten_busy;
     int export_busy;
     int video_open;

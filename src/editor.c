@@ -4834,6 +4834,291 @@ static int zi_wrap(HDC hdc, HFONT font, const wchar_t *text, RECT *rc, int draw)
     return height;
 }
 
+static int zi_year_ok(int year) {
+    SYSTEMTIME now;
+
+    GetLocalTime(&now);
+    return year >= 1960 && year <= (int)now.wYear + 1;
+}
+
+static int zi_day_ok(int year, int month, int day) {
+    static const int length[13] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int leap;
+    int max;
+
+    if (!zi_year_ok(year) || month < 1 || month > 12 || day < 1) {
+        return 0;
+    }
+    if ((year == 1969 && month == 12 && day == 31) || (year == 1970 && month == 1 && day == 1)) {
+        return 0;
+    }
+    leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    max = length[month];
+    if (month == 2 && leap) {
+        max = 29;
+    }
+    return day <= max;
+}
+
+static int zi_digits(const wchar_t *text, int count, int *value) {
+    int i;
+    int n = 0;
+
+    for (i = 0; i < count; i++) {
+        if (text[i] < L'0' || text[i] > L'9') {
+            return 0;
+        }
+        n = n * 10 + (text[i] - L'0');
+    }
+    *value = n;
+    return 1;
+}
+
+/* The latest valid day in the path. A four-digit folder year is the fallback. */
+static void zi_path_capture_line(const wchar_t *path, wchar_t *dest, size_t cap) {
+    const wchar_t *scan;
+    const wchar_t *best_at = NULL;
+    int best_y = 0;
+    int best_m = 0;
+    int best_d = 0;
+    const wchar_t *part;
+    int folder_year = 0;
+
+    dest[0] = L'\0';
+    if (!path || !path[0]) {
+        return;
+    }
+    for (scan = path; *scan; scan++) {
+        int year = 0;
+        int month = 0;
+        int day = 0;
+        const wchar_t *at = NULL;
+        int img = 0;
+
+        if ((scan == path || !((scan[-1] >= L'A' && scan[-1] <= L'Z') || (scan[-1] >= L'a' && scan[-1] <= L'z') ||
+                               (scan[-1] >= L'0' && scan[-1] <= L'9'))) &&
+            (scan[0] == L'I' || scan[0] == L'i') && (scan[1] == L'M' || scan[1] == L'm') &&
+            (scan[2] == L'G' || scan[2] == L'g') && scan[3] == L'_' &&
+            zi_digits(scan + 4, 8, &year)) {
+            month = year % 10000 / 100;
+            day = year % 100;
+            year /= 10000;
+            at = scan + 4;
+            img = 1;
+            if (scan[12] >= L'0' && scan[12] <= L'9') {
+                img = 0;
+            }
+        }
+        if (!img && (scan == path || scan[-1] < L'0' || scan[-1] > L'9') && zi_digits(scan, 4, &year) &&
+            scan[4] == L'-' && zi_digits(scan + 5, 2, &month) && scan[7] == L'-' && zi_digits(scan + 8, 2, &day)) {
+            at = scan;
+            if (scan[10] >= L'0' && scan[10] <= L'9') {
+                at = NULL;
+            }
+        } else if (!img && (scan == path || scan[-1] < L'0' || scan[-1] > L'9') && zi_digits(scan, 8, &year)) {
+            month = year % 10000 / 100;
+            day = year % 100;
+            year /= 10000;
+            at = scan;
+            if (scan[8] >= L'0' && scan[8] <= L'9') {
+                at = NULL;
+            }
+        }
+        if (!at || !zi_day_ok(year, month, day)) {
+            continue;
+        }
+        if (best_at && at <= best_at) {
+            continue;
+        }
+        best_at = at;
+        best_y = year;
+        best_m = month;
+        best_d = day;
+    }
+    if (best_at) {
+        swprintf_s(dest, cap, L"Path date %04d-%02d-%02d", best_y, best_m, best_d);
+        return;
+    }
+    part = path;
+    while (*part) {
+        int year = 0;
+        const wchar_t *next = part;
+
+        while (*next && *next != L'\\' && *next != L'/') {
+            next++;
+        }
+        if (next[0] && next > part && (next - part) == 4 && zi_digits(part, 4, &year) && year != 1969 && zi_year_ok(year)) {
+            folder_year = year;
+        }
+        if (!*next) {
+            break;
+        }
+        part = next + 1;
+    }
+    if (folder_year) {
+        swprintf_s(dest, cap, L"Path year %04d", folder_year);
+    }
+}
+
+static int zi_line_block(HDC hdc, HFONT font, const RECT *rc, wchar_t lines[][260], int count, int gap, int draw) {
+    int y = rc->top;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        RECT box;
+        int height;
+
+        box.left = rc->left;
+        box.right = rc->right;
+        box.top = y;
+        box.bottom = y + 1;
+        height = zi_wrap(hdc, font, lines[i], &box, draw);
+        y += height;
+        if (i + 1 < count) {
+            y += gap;
+        }
+    }
+    return y - rc->top;
+}
+
+int zi_editor_preview_well(ZiApp *app, HDC hdc, const RECT *rc, int draw) {
+    ZiFile *file = NULL;
+    int width;
+    int max_h;
+    const wchar_t *caption = L"Loading preview";
+
+    if (!app || !rc) {
+        return 0;
+    }
+    if (app->file_selected >= 0 && app->file_selected < app->file_count) {
+        file = &app->files[app->file_selected];
+    }
+    if (!file) {
+        return 0;
+    }
+    width = rc->right - rc->left;
+    if (width < 8) {
+        width = 8;
+    }
+    max_h = zi_px(app, 180);
+    if (file->thumb && file->thumb_w > 0 && file->thumb_h > 0) {
+        int dh = max_h;
+        int dw = (file->thumb_w * max_h) / file->thumb_h;
+
+        if (dw > width) {
+            dw = width;
+            dh = (file->thumb_h * width) / file->thumb_w;
+        }
+        if (dh < 1) {
+            dh = 1;
+        }
+        if (draw && hdc) {
+            zi_blit_fit(hdc, file->thumb, file->thumb_w, file->thumb_h, rc->left, rc->top, width, dh);
+        }
+        return dh;
+    }
+    if (file->failed || file->video) {
+        caption = L"No preview is stored for this file.";
+    }
+    if (draw && hdc) {
+        RECT box = *rc;
+        int radius = zi_px(app, 4);
+        HGDIOBJ old_brush = SelectObject(hdc, app->list_brush);
+        HGDIOBJ old_pen = SelectObject(hdc, app->muted_pen);
+
+        box.bottom = box.top + zi_px(app, 120);
+        RoundRect(hdc, box.left, box.top, box.right, box.bottom, radius, radius);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, ZI_INK);
+        InflateRect(&box, -zi_px(app, 8), 0);
+        DrawTextW(hdc, caption, -1, &box, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+    }
+    return zi_px(app, 120);
+}
+
+int zi_editor_date_facts(ZiApp *app, HDC hdc, const RECT *rc, int draw) {
+    wchar_t lines[12][260];
+    int count = 0;
+    ZiFile *file = NULL;
+    int gap;
+    const wchar_t *placeholder;
+
+    if (!app || !rc || !hdc) {
+        return 0;
+    }
+    placeholder = app->source_server
+        ? L"Select a file to see its preview and the date stored for it."
+        : L"Select a file to see its preview and the dates in the file.";
+    gap = zi_px(app, 8);
+    if (app->file_selected >= 0 && app->file_selected < app->file_count) {
+        file = &app->files[app->file_selected];
+    }
+    if (!file) {
+        wcscpy_s(lines[count], 260, placeholder);
+        count++;
+    } else if (app->source_server) {
+        const wchar_t *dot = wcsrchr(file->name, L'.');
+        wchar_t path_line[80];
+        int i;
+
+        wcscpy_s(lines[count], 260, file->path[0] ? file->path : file->name);
+        count++;
+        if (file->capture[0]) {
+            swprintf_s(lines[count], 260, L"Catalog date %s", file->capture);
+        } else {
+            wcscpy_s(lines[count], 260, L"No date is stored in the catalog.");
+        }
+        count++;
+        wcscpy_s(lines[count], 260, L"No capture source is stored.");
+        count++;
+        wcscpy_s(lines[count], 260, L"Catalog confidence is not stored.");
+        count++;
+        if (file->video && dot && dot[1]) {
+            swprintf_s(lines[count], 260, L"video %s", dot + 1);
+            count++;
+        } else if (file->video) {
+            wcscpy_s(lines[count], 260, L"video");
+            count++;
+        } else if (dot && dot[1]) {
+            wcscpy_s(lines[count], 260, dot + 1);
+            count++;
+        }
+        zi_path_capture_line(file->path, path_line, 80);
+        if (path_line[0] && count < 12) {
+            wcscpy_s(lines[count], 260, path_line);
+            count++;
+        }
+        if (app->fact_ready && _wcsicmp(app->fact_path, file->path) == 0) {
+            for (i = 0; i < app->fact_count && count < 12; i++) {
+                if (wcscmp(app->fact_lines[i], file->name) == 0 || wcscmp(app->fact_lines[i], file->path) == 0) {
+                    continue;
+                }
+                wcscpy_s(lines[count], 260, app->fact_lines[i]);
+                count++;
+            }
+        }
+    } else if (app->fact_ready && _wcsicmp(app->fact_path, file->path) == 0) {
+        int i;
+
+        for (i = 0; i < app->fact_count && count < 12; i++) {
+            wcscpy_s(lines[count], 260, app->fact_lines[i]);
+            count++;
+        }
+    } else {
+        wcscpy_s(lines[count], 260, file->name);
+        count++;
+        wcscpy_s(lines[count], 260, file->path);
+        count++;
+    }
+    if (draw) {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, ZI_INK);
+    }
+    return zi_line_block(hdc, app->font, rc, lines, count, gap, draw);
+}
+
 void zi_editor_paint_details(ZiApp *app, HDC hdc) {
     RECT column = app->regions.right;
     RECT text;

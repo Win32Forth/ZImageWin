@@ -12,7 +12,9 @@
 #include <winnetwk.h>
 
 #include <shlobj.h>
+#include <shellapi.h>
 #include <shobjidl.h>
+#include <winver.h>
 #include <wincodec.h>
 #include <windowsx.h>
 #include <stdio.h>
@@ -239,6 +241,66 @@ static int zi_ask(ZiApp *app, const wchar_t *text, UINT type) {
     answer = MessageBoxW(app && app->hwnd ? app->hwnd : NULL, text, L"ZImager", type);
     g_modal = saved;
     return answer;
+}
+
+static int zi_version_string(const void *block, const wchar_t *name, wchar_t *dest, size_t cap) {
+    wchar_t query[96];
+    wchar_t *value = NULL;
+    UINT len = 0;
+
+    dest[0] = L'\0';
+    swprintf_s(query, 96, L"\\StringFileInfo\\040904B0\\%s", name);
+    if (!VerQueryValueW(block, query, (void **)&value, &len) || !value || !value[0] || cap < 2) {
+        return 0;
+    }
+    wcsncpy_s(dest, cap, value, _TRUNCATE);
+    return 1;
+}
+
+/* Help, About ZImager. The numbers come from the running executable. */
+static void zi_about(HWND hwnd) {
+    wchar_t path[MAX_PATH];
+    wchar_t product[64];
+    wchar_t file[64];
+    wchar_t heading[96];
+    wchar_t body[MAX_PATH + 160];
+    DWORD unused = 0;
+    DWORD bytes;
+    void *block;
+    int saved = g_modal;
+    const wchar_t *arch =
+#if defined(_M_ARM64)
+        L"ARM64";
+#elif defined(_M_X64)
+        L"x64";
+#else
+        L"x86";
+#endif
+
+    product[0] = L'\0';
+    file[0] = L'\0';
+    path[0] = L'\0';
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    bytes = path[0] ? GetFileVersionInfoSizeW(path, &unused) : 0;
+    block = bytes ? malloc(bytes) : NULL;
+    if (block && GetFileVersionInfoW(path, 0, bytes, block)) {
+        zi_version_string(block, L"ProductVersion", product, 64);
+        zi_version_string(block, L"FileVersion", file, 64);
+    }
+    free(block);
+    if (product[0]) {
+        swprintf_s(heading, 96, L"ZImager#%s", product);
+    } else {
+        wcscpy_s(heading, 96, L"ZImager");
+    }
+    if (file[0]) {
+        swprintf_s(body, MAX_PATH + 160, L"File version %s\n%s\n%s", file, arch, path);
+    } else {
+        swprintf_s(body, MAX_PATH + 160, L"The version resource could not be read.\n%s\n%s", arch, path);
+    }
+    g_modal = 1;
+    ShellAboutW(hwnd, heading, body, LoadIconW(NULL, IDI_APPLICATION));
+    g_modal = saved;
 }
 
 static int zi_name_less(const void *a, const void *b) {
@@ -1364,13 +1426,12 @@ static void zi_on_click(ZiApp *app, int id, int extra, int x) {
     case ZI_ID_FIND: {
         wchar_t text[ZI_NAME];
 
-        wcscpy_s(text, ZI_NAME, app->name_filter);
-        if (zi_ask_name(app->hwnd, L"Find", text, ZI_NAME)) {
-            zi_grid_set_filter(app, text);
-        }
+        zi_library_read_filter(text, ZI_NAME);
+        zi_grid_set_filter(app, text);
         break;
     }
     case ZI_ID_CLEAR_FILTER:
+        zi_library_set_filter_text(L"");
         zi_grid_set_filter(app, L"");
         break;
     case ZI_ID_PAGE_FIRST:
@@ -1384,6 +1445,14 @@ static void zi_on_click(ZiApp *app, int id, int extra, int x) {
         break;
     case ZI_ID_PAGE_LAST:
         zi_grid_set_page(app, zi_grid_page_count(app) - 1);
+        break;
+    case ZI_ID_FOLD_PREVIEW:
+        app->fold_preview = !app->fold_preview;
+        zi_redraw(app);
+        break;
+    case ZI_ID_FOLD_PAGE:
+        app->fold_page = !app->fold_page;
+        zi_redraw(app);
         break;
     case ZI_ID_FOLD_DATE:
         app->fold_date = !app->fold_date;
@@ -1415,7 +1484,11 @@ static void zi_on_click(ZiApp *app, int id, int extra, int x) {
         app->move_sub = !app->move_sub;
         zi_redraw(app);
         break;
+    case ZI_ID_SET_DATE:
+        zi_library_apply_date(app);
+        break;
     case ZI_ID_MOVE_GO:
+        zi_library_read_move(app);
         if (app->source_server) {
             zi_notice(app, L"Move on the server is left for a confirmed run.");
             break;
@@ -1476,13 +1549,27 @@ static void zi_on_click(ZiApp *app, int id, int extra, int x) {
         break;
     }
     case ZI_ID_MERGE_H:
-        zi_merge_arm(app, 0);
+        if (app->merge_open) {
+            zi_merge_arm(app, 0);
+        } else {
+            app->merge_vertical = 0;
+            zi_redraw(app);
+        }
         break;
     case ZI_ID_MERGE_V:
-        zi_merge_arm(app, 1);
+        if (app->merge_open) {
+            zi_merge_arm(app, 1);
+        } else {
+            app->merge_vertical = 1;
+            zi_redraw(app);
+        }
         break;
     case ZI_ID_MERGE_OK:
-        zi_merge_accept(app);
+        if (app->merge_open) {
+            zi_merge_accept(app);
+        } else {
+            zi_merge_arm(app, app->merge_vertical);
+        }
         break;
     case ZI_ID_MERGE_CANCEL:
         zi_merge_cancel(app);
@@ -1993,6 +2080,9 @@ static void zi_on_command(ZiApp *app, int cmd) {
     case ZI_CMD_FLIP_V:
         zi_editor_flip(app, 0);
         break;
+    case ZI_CMD_ABOUT:
+        zi_about(app->hwnd);
+        break;
     default:
         break;
     }
@@ -2215,7 +2305,7 @@ static void zi_on_wheel(ZiApp *app, int delta, POINT pt) {
         zi_library_wheel(app, delta);
         return;
     }
-    if (PtInRect(&app->regions.canvas, pt) && zi_grid_active(app)) {
+    if (PtInRect(&app->regions.canvas, pt) && zi_grid_active(app) && !app->merge_open) {
         zi_grid_wheel(app, delta);
         return;
     }
@@ -2227,6 +2317,24 @@ static void zi_on_wheel(ZiApp *app, int delta, POINT pt) {
         app->folder_scroll += step * 3;
         if (app->folder_scroll < 0) {
             app->folder_scroll = 0;
+        }
+        zi_redraw(app);
+        return;
+    }
+    if (PtInRect(&app->regions.right, pt) && zi_showing_folder(app) && !app->events_open && !app->reorg_open &&
+        !(app->source_server && app->library_section == 2)) {
+        int view = app->regions.right.bottom - app->regions.right.top;
+        int max_scroll = app->detail_content - view;
+
+        if (max_scroll < 0) {
+            max_scroll = 0;
+        }
+        app->detail_scroll += step * row * 3;
+        if (app->detail_scroll < 0) {
+            app->detail_scroll = 0;
+        }
+        if (app->detail_scroll > max_scroll) {
+            app->detail_scroll = max_scroll;
         }
         zi_redraw(app);
         return;
@@ -2754,6 +2862,7 @@ static HMENU zi_menu_bar(void) {
     HMENU file = CreatePopupMenu();
     HMENU edit = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
+    HMENU help = CreatePopupMenu();
 
     AppendMenuW(file, MF_STRING, ZI_CMD_OPEN_FILE, L"Open File\tCtrl+O");
     AppendMenuW(file, MF_STRING, ZI_CMD_OPEN_FOLDER, L"Open Folder");
@@ -2779,9 +2888,11 @@ static HMENU zi_menu_bar(void) {
     AppendMenuW(view, MF_STRING, ZI_CMD_SERVER, L"Server");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, ZI_CMD_SUBFOLDER, L"Sub-folder");
+    AppendMenuW(help, MF_STRING, ZI_CMD_ABOUT, L"About ZImager");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"Edit");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"View");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"Help");
     return bar;
 }
 
@@ -2830,6 +2941,8 @@ int zi_run(HINSTANCE instance) {
     for (i = 0; i < ZI_SECTIONS; i++) {
         g_app.section_open[i] = 1;
     }
+    g_app.fold_preview = 1;
+    g_app.fold_page = 1;
     g_app.fold_date = 1;
     g_app.fold_move = 1;
     g_app.fold_merge = 1;

@@ -962,6 +962,7 @@ void zi_grid_load(ZiApp *app) {
     zi_catalog_drop();
     zi_grid_free_files(app);
     app->notice[0] = L'\0';
+    app->build_note[0] = L'\0';
     zi_grid_clear_counts(app);
     wcscpy_s(app->file_dir, MAX_PATH, dir);
     zi_grid_list(app, dir, nested);
@@ -1024,8 +1025,16 @@ static int zi_grid_dip(const ZiApp *app) {
     return dip;
 }
 
-static int zi_grid_header(const ZiApp *app) {
-    return zi_px(app, 44);
+int zi_grid_header(const ZiApp *app) {
+    int base = zi_px(app, 44);
+    int notice = app->notice[0] ? zi_px(app, 36) : 0;
+
+    /* Server Photos and Review keep a tool row above the preview slider. */
+    if (app->source_server && zi_showing_folder(app) && !app->events_open && !app->reorg_open &&
+        app->library_section != 2) {
+        base = zi_px(app, 84);
+    }
+    return base + notice;
 }
 
 static int zi_grid_cell_px(const ZiApp *app) {
@@ -1072,7 +1081,8 @@ static void zi_grid_header_layout(ZiApp *app, HDC hdc, RECT *track, RECT *value,
     RECT canvas = app->regions.canvas;
     int pad = zi_px(app, 16);
     int x = canvas.left + pad;
-    int y = canvas.top + zi_px(app, 8);
+    int tool = 0;
+    int y;
     int h = zi_px(app, 26);
     int label_w = zi_px(app, 100);
     int track_w = zi_px(app, 140);
@@ -1080,6 +1090,11 @@ static void zi_grid_header_layout(ZiApp *app, HDC hdc, RECT *track, RECT *value,
     SIZE size;
     HFONT old;
 
+    if (app->source_server && zi_showing_folder(app) && !app->events_open && !app->reorg_open &&
+        app->library_section != 2) {
+        tool = zi_px(app, 46);
+    }
+    y = canvas.top + (tool ? tool : zi_px(app, 8));
     if (hdc) {
         old = (HFONT)SelectObject(hdc, app->font);
         GetTextExtentPoint32W(hdc, L"Preview size", 12, &size);
@@ -1103,9 +1118,12 @@ static void zi_grid_header_layout(ZiApp *app, HDC hdc, RECT *track, RECT *value,
     x += value_w + zi_px(app, 12);
     if (title) {
         title->left = x;
-        title->top = canvas.top;
+        title->top = y;
         title->right = canvas.right - pad;
-        title->bottom = canvas.top + zi_grid_header(app);
+        title->bottom = y + h;
+        if (app->filter_field.left > title->left + zi_px(app, 24)) {
+            title->right = app->filter_field.left - zi_px(app, 8);
+        }
     }
 }
 
@@ -1198,7 +1216,7 @@ void zi_grid_sync_bar(ZiApp *app) {
             g_vscroll_proc = (WNDPROC)SetWindowLongPtrW(g_vscroll, GWLP_WNDPROC, (LONG_PTR)zi_vscroll_proc);
         }
     }
-    show = g_vscroll && zi_grid_active(app);
+    show = g_vscroll && zi_grid_active(app) && !app->merge_open;
     zi_grid_clamp(app);
     if (!show) {
         zi_move_bar(g_vscroll, 0, 0, 0, 0, 0);
@@ -1345,10 +1363,22 @@ void zi_grid_paint(ZiApp *app, HDC hdc) {
     SelectObject(hdc, old_pen);
     swprintf_s(points, 16, L"%d pt", zi_grid_dip(app));
     DrawTextW(hdc, points, -1, &value, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    DrawTextW(hdc, base, -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (!app->source_server || app->library_section == 2 || app->events_open || app->reorg_open) {
+        DrawTextW(hdc, base, -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (app->notice[0]) {
+        RECT note = canvas;
+
+        note.left += zi_px(app, 16);
+        note.right -= zi_px(app, 16);
+        note.bottom = canvas.top + zi_grid_header(app);
+        note.top = note.bottom - zi_px(app, 36);
+        SetTextColor(hdc, ZI_INK);
+        DrawTextW(hdc, app->notice, -1, &note, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     saved = SaveDC(hdc);
     clip = canvas;
-    clip.top = title.bottom;
+    clip.top = canvas.top + zi_grid_header(app);
     clip.right -= zi_grid_bar_w(app);
     if (clip.right < clip.left) {
         clip.right = clip.left;
@@ -1913,27 +1943,27 @@ static void zi_preview_result(ZiApp *app, int photos, int built, int missed) {
     const wchar_t *noun;
 
     if (photos <= 0) {
-        wcscpy_s(app->notice, 192, L"This folder has no photos.");
+        wcscpy_s(app->build_note, 192, L"This folder has no photos.");
         return;
     }
     if (built <= 0 && missed <= 0) {
-        wcscpy_s(app->notice, 192, L"Every photo in this folder already has a preview.");
+        wcscpy_s(app->build_note, 192, L"Every photo in this folder already has a preview.");
         return;
     }
     if (built <= 0) {
-        wcscpy_s(app->notice, 192, L"No preview could be read.");
+        wcscpy_s(app->build_note, 192, L"No preview could be read.");
         return;
     }
     noun = built == 1 ? L"preview" : L"previews";
     if (missed <= 0) {
-        swprintf_s(app->notice, 192, L"Built %d %s.", built, noun);
+        swprintf_s(app->build_note, 192, L"Built %d %s.", built, noun);
         return;
     }
     if (missed == 1) {
-        swprintf_s(app->notice, 192, L"Built %d %s. 1 photo could not be read.", built, noun);
+        swprintf_s(app->build_note, 192, L"Built %d %s. 1 photo could not be read.", built, noun);
         return;
     }
-    swprintf_s(app->notice, 192, L"Built %d %s. %d photos could not be read.", built, noun, missed);
+    swprintf_s(app->build_note, 192, L"Built %d %s. %d photos could not be read.", built, noun, missed);
 }
 
 void zi_grid_build_previews(ZiApp *app) {
@@ -1949,22 +1979,22 @@ void zi_grid_build_previews(ZiApp *app) {
         return;
     }
     if (app->source_server) {
-        wcscpy_s(app->notice, 192, L"Server previews stay on the NAS.");
+        wcscpy_s(app->build_note, 192, L"Server previews stay on the NAS.");
         zi_grid_invalidate(app);
         return;
     }
     if (app->file_filtered || app->name_filter[0]) {
-        wcscpy_s(app->notice, 192, L"Clear the name filter before building previews.");
+        wcscpy_s(app->build_note, 192, L"Clear the name filter before building previews.");
         zi_grid_invalidate(app);
         return;
     }
     if (!g_have_catalog || g_still_count <= 0) {
-        wcscpy_s(app->notice, 192, L"This folder has no photos.");
+        wcscpy_s(app->build_note, 192, L"This folder has no photos.");
         zi_grid_invalidate(app);
         return;
     }
     if (!zi_preview_folder(folder, MAX_PATH)) {
-        wcscpy_s(app->notice, 192, L"No preview could be read.");
+        wcscpy_s(app->build_note, 192, L"No preview could be read.");
         zi_grid_invalidate(app);
         return;
     }

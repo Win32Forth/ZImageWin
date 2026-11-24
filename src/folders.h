@@ -52,6 +52,8 @@ int zi_json_confirm(char *dest, size_t cap, const char *capture_yyyy_mm_dd);
 int zi_merge_arm(ZiApp *app, int vertical);
 void zi_merge_cancel(ZiApp *app);
 void zi_merge_paint(ZiApp *app, HDC hdc);
+/* 1 when both photos of the open join have been read. */
+int zi_merge_ready(void);
 int zi_merge_dragging(void);
 /* Arrow keys move the second photo one pixel. Returns 1 when the key was used. */
 int zi_merge_key(ZiApp *app, int vk);

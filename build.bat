@@ -22,7 +22,7 @@ cd /d "%~dp0"
 if not exist build\arm64 mkdir build\arm64
 rc /nologo /fo build\arm64\ZImager.res src\ZImager.rc
 if errorlevel 1 exit /b 1
-cl /nologo /W4 /std:c11 /O2 /utf-8 /DUNICODE /D_UNICODE /Fe:build\arm64\ZImager.exe /Fo:build\arm64\ src\app.c src\chrome.c src\helper.c src\grid.c src\library.c src\editor.c src\tone.c src\touchup.c src\blake3.c src\zimg.c src\features.c src\media.c src\folders.c build\arm64\ZImager.res /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:src\ZImager.manifest user32.lib gdi32.lib ole32.lib shell32.lib uuid.lib winhttp.lib bcrypt.lib crypt32.lib mpr.lib windowscodecs.lib oleaut32.lib comdlg32.lib msimg32.lib mfplat.lib mfreadwrite.lib mfuuid.lib
+cl /nologo /W4 /std:c11 /O2 /utf-8 /DUNICODE /D_UNICODE /Fe:build\arm64\ZImager.exe /Fo:build\arm64\ src\app.c src\chrome.c src\helper.c src\grid.c src\library.c src\editor.c src\tone.c src\touchup.c src\blake3.c src\zimg.c src\features.c src\media.c src\folders.c build\arm64\ZImager.res /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:src\ZImager.manifest user32.lib gdi32.lib ole32.lib shell32.lib uuid.lib winhttp.lib bcrypt.lib crypt32.lib mpr.lib windowscodecs.lib oleaut32.lib comdlg32.lib msimg32.lib mfplat.lib mfreadwrite.lib mfuuid.lib version.lib
 if errorlevel 1 exit /b 1
 echo Built build\arm64\ZImager.exe
 exit /b 0

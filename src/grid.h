@@ -27,6 +27,8 @@ typedef struct ZiListNote {
 void zi_grid_load(ZiApp *app);
 void zi_grid_shutdown(ZiApp *app);
 int zi_grid_active(const ZiApp *app);
+/* Header above the cells. Taller on the Server folder grid, which has a tool row. */
+int zi_grid_header(const ZiApp *app);
 /* Keeps helper order. file_dir is left unchanged. The caller frees nothing; this takes files. */
 void zi_grid_install(ZiApp *app, ZiFile *files, int count);
 /* Drops the grid and file_dir so the next Photos walk reads the folder again. */

@@ -100,6 +100,10 @@ void zi_editor_history_select(ZiApp *app, int index);
 
 int zi_editor_paint(ZiApp *app, HDC hdc);
 void zi_editor_paint_details(ZiApp *app, HDC hdc);
+/* Folder Preview well. Returns the height. Draws into rc when draw is set. */
+int zi_editor_preview_well(ZiApp *app, HDC hdc, const RECT *rc, int draw);
+/* Folder Date facts. Returns the height. Draws into rc when draw is set. */
+int zi_editor_date_facts(ZiApp *app, HDC hdc, const RECT *rc, int draw);
 
 int zi_editor_can_undo(const ZiApp *app);
 int zi_editor_can_redo(const ZiApp *app);

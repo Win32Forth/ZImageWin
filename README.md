@@ -1,8 +1,8 @@
-# ZImager 1.8.6 for Windows
+# ZImager 1.8.6.1 for Windows
 
-ZImager 1.8.6 is the app. It matches the Mac marketing version in the sibling `ZImage` tree. One window. Disk is the editor. Server is the library. The original photograph is left where it is.
+ZImager 1.8.6.1 is the app. The photograph tools match the Mac 1.8.6 app in the sibling `ZImage` tree. This Windows build adds the folder-column layout, the Tone button order, and Help, About ZImager. One window. Disk is the editor. Server is the library. The original photograph is left where it is.
 
-Assembly identity is `Win32Forth.ZImager` 1.8.6.0. The installers are `dist\ZImager-1.8.6-arm64.exe` and `dist\ZImager-1.8.6-x64.exe`. A `.zimg` file stays schema 1 and writes `appVersion` `1.0.0`, the same envelope the Mac writes. Grades are linear sRGB on the CPU. Windows 10 and Windows 11 are the two targets, on ARM64 and on x64. Both builds compile the same C sources.
+Assembly identity is `Win32Forth.ZImager` 1.8.6.1. File version and product version are both 1.8.6.1. The installers are `dist\ZImager-1.8.6.1-arm64.exe` and `dist\ZImager-1.8.6.1-x64.exe`. A `.zimg` file stays schema 1 and writes `appVersion` `1.0.0`, the same envelope the Mac writes. Grades are linear sRGB on the CPU. Windows 10 and Windows 11 are the two targets, on ARM64 and on x64. Both builds compile the same C sources.
 
 The NAS helper stays the Go program already installed with the library. This tree does not build it and the installer does not ship it.
 
@@ -16,12 +16,12 @@ Server Move, Organize, Clean, Rescan, and Rename show a notice and leave the lib
 
 Use the installer that matches the PC:
 
-- `dist\ZImager-1.8.6-arm64.exe` on ARM64 Windows
-- `dist\ZImager-1.8.6-x64.exe` on x64 Windows
+- `dist\ZImager-1.8.6.1-arm64.exe` on ARM64 Windows
+- `dist\ZImager-1.8.6.1-x64.exe` on x64 Windows
 
 Each installer is per user. It does not ask for an administrator password. ZImager.exe lands in `%LOCALAPPDATA%\Programs\ZImager-ARM64` or `%LOCALAPPDATA%\Programs\ZImager-x64`, with a Start menu shortcut named ZImager ARM64 or ZImager x64. The desktop icon task is offered and left unchecked.
 
-Uninstall removes the program. Edits, the helper pin, and the last folder stay in `%LOCALAPPDATA%\ZImageWin`. The 1.0.0 installers remain in `dist` for the previous release.
+Uninstall removes the program. Edits, the helper pin, and the last folder stay in `%LOCALAPPDATA%\ZImageWin`. The 1.0.0 and 1.8.6 installers remain in `dist` for those releases.
 
 ## Build
 
@@ -35,11 +35,11 @@ build-test-x64.bat
 Install\build-installers.bat
 ```
 
-`build.bat` writes `build\arm64\ZImager.exe`. `build-x64.bat` writes `build\x64\ZImager.exe`. The two test scripts compile the grade checks in `src\features.c` and print `ok`. File properties say 1.8.6. The embedded manifest says 1.8.6.0. `Install\build-installers.bat` reads those two programs and writes the 1.8.6 installers.
+`build.bat` writes `build\arm64\ZImager.exe`. `build-x64.bat` writes `build\x64\ZImager.exe`. The two test scripts compile the grade checks in `src\features.c` and print `ok`. File properties say 1.8.6.1. The embedded manifest says 1.8.6.1. `Install\build-installers.bat` reads those two programs and writes the 1.8.6.1 installers.
 
 ## Changes since 1.0.0
 
-These are the Mac 1.7.1 through 1.8.6 additions now in this Windows build. The sections below describe how they work here.
+These are the Mac 1.7.1 through 1.8.6 additions now in this Windows build, plus the 1.8.6.1 folder-column match. The sections below describe how they work here.
 
 1.7.1. Each repair is its own history step. Spot clicks queue while one removal runs. The shared repair list holds 64 entries. The canvas says how many spots remain, including the one running. Undo, redo, reset, and opening another photograph clear the queue.
 
@@ -55,21 +55,31 @@ These are the Mac 1.7.1 through 1.8.6 additions now in this Windows build. The s
 
 1.8.3. Merge joins exactly two stills from the same folder into an 8-bit TIFF named `{first}-{second}.tiff`. The originals stay. Preview starts flush. Arrow keys move the second photo one pixel. Click zooms in. Alt-click zooms out and stops at fit. Space-drag pans. Fit and 100% are on the preview. Cancel writes nothing. After the preview closes, right-click Rename changes the clicked file's name in the same folder. The Events and Reorganize buttons are hidden. Keystone runs after turns and flips.
 
-1.8.4. Four threads decode the page on screen. Disk previews are temporary JPEGs under `%TEMP%\ZImageWin\previews`, capped at 200 MB. Server previews stay on the NAS. The path beside Rescan ends with the still count. Date has Organize and Clean. Disk Organize asks, then reads the page on screen into year and day folders. A photo with no date goes to `Photos\_Review`. Clean on a local drive deletes thumbnail junk and folders that have nothing else. Photos itself stays. A reparse point is left in place. Right-click a folder in the tree and choose Rename. Photos and the three shelves keep their names. Disk rename stays on this PC. Server Organize, Clean, Rescan, and Rename say the action is left for a confirmed run.
+1.8.4. Four threads decode the page on screen. Disk previews are temporary JPEGs under `%TEMP%\ZImageWin\previews`, capped at 200 MB. Server previews stay on the NAS. The path beside Rescan ends with the still count. The local organize routine reads the page on screen into year and day folders. A photo with no date goes to `Photos\_Review`. The local clean deletes thumbnail junk and folders that have nothing else. Photos itself stays. A reparse point is left in place. In 1.8.6.1 the Organize and Clean buttons sit on Server Photos and show the confirmed-run notice. Right-click a folder in the tree and choose Rename. Photos and the three shelves keep their names. Disk rename stays on this PC. Server Organize, Clean, Rescan, and Rename say the action is left for a confirmed run.
 
 1.8.5. Curve sits between Tone and Color. RGB, Red, Green, and Blue each have a curve. Linear, Matte, Film Moody, Punch, and Lo-fi set the RGB curve. Drag a handle. Click to add a point, up to eight. Double-click a middle handle to remove it. Double-click an end to put that corner back. Vignette sits under Touchup, with Amount, Midpoint, Roundness, Feather, X, and Y. Positive Y moves the clear center up. With no tool armed, a left drag pans, and the wheel zooms. Each folder panel folds from an arrow on its title. Build previews covers the open folder and skips videos. A Sigma X3F opens its embedded JPEG. The Sigma sensor converter is absent. X3I files are not opened. An older `.zimg` with no curve, vignette, or flip stays upright.
 
 1.8.6. View has Flip Left/Right above Flip Top/Bottom, under the rotate commands. Each mirror is one history step, and the same command restores that edge. An odd turn swaps the two flags. A crop and a repair follow the photograph. Leaving Image for Folder returns to Zoom and releases a stay-clicked tool. Flatten is available for an open still, including an empty edit list, and stays off for a video, the PDF picker, and while Flatten or Export is writing. Automatic previews stop at the page on screen. Server Rescan is present as a client and does not call the helper in this build.
 
+1.8.6.1. The Folder column matches the Mac stack and scrolls on its own. When a Photos folder has more than one page, the page panel is first. Its title is the still count, "N photos", or "Counting photos…" while the list is walking. The range is "201–400 of 1,842", with an en dash, and the total is left off while counting. First and Prev 200 share a row. Next 200 and Last share the next. Preview follows, then Date. Photos also has Move, Merge, and Build previews. Review keeps Preview, Date, and Set date. Duplicates keeps its own side panel. Events and Reorganize skip this stack. Each panel starts open. The disclosure sits at the right of the title, and the title starts a short space in from the left. Open points down. Collapsed points up. The folder-tree chevron stays on the left of the folder name.
+
+Preview fits the selected still in the well, at most 180 dip tall. With nothing ready the well says "Loading preview" or "No preview is stored for this file." Date lists the catalog facts, the path date, and the header lines. With nothing selected it says "Select a file to see its preview and the date stored for it." On Server Photos and Review the field cue is "YYYY-MM-DD or year" and the button is Set date. Organize and Clean are stacked under that on Server Photos. Each shows its confirmed-run notice. Disk Date lists the facts and has no field.
+
+Find, Clear filter, Rescan, the path with the still count, and Delete ALL sit on the center header. Server Photos and Review use two rows: the tools, then Preview size. Disk uses one row: Preview size, the folder name, the name field, Find, and Clear filter. On `Photos\_Removed` the name field, Find, and Clear filter are replaced by Delete ALL. While a merge preview is open, that preview replaces the grid, header included. The picture is on black. Fit and 100% sit at the left of the strip above it. The side button reads Preview until the join is open, then Merge. Merge stays off until both stills are read. Horizontal and Vertical choose the axis, and while the preview is open they retarget it. The panel says "Option-click". That click is Alt-click.
+
+The Tone title row is Auto, Reset, Flatten. Flatten is the rightmost of the three. Help, About ZImager reads the product version, the file version, ARM64 or x64, and the path from the program that is running.
+
 ## The window
 
-The toolbar switches Disk and Server, and Folder and Image. The menus are File, Edit, and View.
+The toolbar switches Disk and Server, and Folder and Image. The menus are File, Edit, View, and Help.
 
 File: Open File (Ctrl+O), Open Folder, Save (Ctrl+S), Save As (Ctrl+Shift+S), Exit.
 
 Edit: Undo (Ctrl+Z), Redo (Ctrl+Y), Copy (Ctrl+C), Paste (Ctrl+V).
 
 View: Folder View (Ctrl+F), Edit View (Ctrl+E), Rotate Counterclockwise, Rotate Clockwise, Flip Left/Right, Flip Top/Bottom, Disk, Server, Sub-folder. The toolbar button for Edit View says Image. Flip and rotate have no accelerator. The eyedropper stays a toolbar tool.
+
+Help: About ZImager. The dialog reads the product version and the file version from the running program, then ARM64 or x64, then the path of that program. About has no accelerator.
 
 The smallest window is 1100 by 700. The inspector is the column on the right. Its sections are Spectrum, Tone, Curve, Color, Geometry, Touchup, Vignette, and History.
 
@@ -79,19 +89,21 @@ Leaving Image for Folder returns to Zoom and releases a stay-clicked tool.
 
 Open Folder sets the root of an indented folder tree. A chevron opens the next level. Choosing a name lists that folder. Hidden names, names that start with a dot, and links are skipped. The root and the selected folder are saved in `%LOCALAPPDATA%\ZImageWin\folder.ini` and opened again at the next launch. If that folder is gone, the window says "The last folder could not be opened."
 
-The folder catalog holds up to 20000 names. The 20001st name stops the walk and the window says "The folder shows the first 20000 names." Page 0 shows the first 200 stills and at most 300 videos, sorted by name. Later pages show 200 stills at a time. Videos stay off those later pages and out of the still count. More than 300 videos says "The folder shows the first 300 videos." Stills include X3F and PDF. Find searches the whole catalog. A miss says "No photos match that name." Clear shows the folder again. When more than one page exists, First, Prev 200, Next 200, and Last sit with "Page N of M".
+The folder catalog holds up to 20000 names. The 20001st name stops the walk and the window says "The folder shows the first 20000 names." Page 0 shows the first 200 stills and at most 300 videos, sorted by name. Later pages show 200 stills at a time. Videos stay off those later pages and out of the still count. More than 300 videos says "The folder shows the first 300 videos." Stills include X3F and PDF. Find searches the whole catalog. A miss says "No photos match that name." Clear filter shows the folder again. The name field, Find, and Clear filter sit on the center header, on the same row as Preview size. When more than one page exists, the right column opens with the page panel. The title is the still count. The range uses an en dash, for example "201–400 of 1,842". While the list is counting, the title is "Counting photos…" and the range omits the total. First and Prev 200 share the first row. Next 200 and Last share the second.
 
 The Preview slider changes the drawn tile size from 80 to 480 dip, starting at 160. A tile's long side is at most 250 pixels. Four threads decode the page on screen. Automatic previews stop at that page. Build previews, under Merge, writes 250-pixel JPEGs under `%TEMP%\ZImageWin\previews` for the open folder, with a 200 MB cap. Videos are left out. A name filter has to be cleared first. On Server the same button says "Server previews stay on the NAS." and does not upload.
 
 Sub-folder, while it is on, also lists stills and videos in child folders. Until a folder is opened, the Disk column says "Open a folder to see its subfolders."
 
-The right column in Folder view stacks folding panels: Date, Move selected files, Merge two photos, and Build previews. Each panel starts open. Preview is the title above the picture.
+The right column in Folder view is 280 dip wide and scrolls on its own. On Disk, and on Server Photos, the stack is the page panel when there is more than one page, then Preview, Date, Move selected files, Merge two photos, and Build previews. Each panel starts open. The disclosure arrow sits at the right of the title. The title starts a short space in from the left. Open points down. Collapsed points up. The tree beside the grid still puts its chevron on the left of the folder name.
 
-Date has Organize and Clean. Organize on Disk asks "Organize the photos on this page into year and day folders?" Yes reads the page on screen. A photo with no date goes to `Photos\_Review` under the tree root. A dated photo goes to `Photos\YYYY\YYYY-MM-DD`. A photo already in that year and day folder stays. A moved photo that matches another file of the same size leaves a 250-pixel JPEG in `Photos\_Duplicates`. Later pages are left where they are. Clean on a local drive asks "Delete empty folders and junk files in this folder?" Yes deletes Thumbs.db, ehthumbs.db, desktop.ini, .DS_Store, and AppleDouble `._` files, then a folder that has nothing else. The starting folder stays. A reparse point is left in place. A UNC path says "Clean on the server is left for a confirmed run."
+Preview shows the selected still fitted in the well, at most 180 dip tall. Nothing ready shows "Loading preview" or "No preview is stored for this file."
+
+On Disk, Date lists the facts for the selected file. With nothing selected it says "Select a file to see its preview and the date stored for it." Set date, Organize, and Clean are on the Server Photos Date panel. Those buttons show "Organize on the server is left for a confirmed run." and "Clean on the server is left for a confirmed run." The local organize routine stays in the program for a later confirmed run. It reads the page on screen. A photo with no date goes to `Photos\_Review` under the tree root. A dated photo goes to `Photos\YYYY\YYYY-MM-DD`. A photo already in that year and day folder stays. A moved photo that matches another file of the same size leaves a 250-pixel JPEG in `Photos\_Duplicates`. Later pages are left where they are. The question it asks is "Organize the photos on this page into year and day folders?" The local clean asks "Delete empty folders and junk files in this folder?" Yes deletes Thumbs.db, ehthumbs.db, desktop.ini, .DS_Store, and AppleDouble `._` files, then a folder that has nothing else. The starting folder stays. A reparse point is left in place.
 
 Move sits between Date and Merge. The caption is "Move selected files to specified Folder". The checkbox "Sub-folder of this folder" starts unchecked. Unchecked, the named folder is created under the opened tree root. Checked, it is created inside the folder on screen. A file already in the destination stays. The same name becomes name-2. The names `_Removed`, `_Duplicates`, and `_Review` are refused. The tree reloads. Server Move says "Move on the server is left for a confirmed run."
 
-Merge joins exactly two stills from the same folder. Horizontal or Vertical. The first clicked marked still is left or top when the anchor and the selection are two different marked stills. Otherwise the two marked stills are used in index order. Any other count says "Select two stills from this folder." Preview starts flush. Arrow keys, including Shift-arrow, move the second photo one pixel. Click zooms in. Alt-click zooms out and stops at fit. Space-drag moves the whole picture. Fit and 100% are on the preview. 100% is one image pixel per point, centered on the seam, and a second click recenters. Changing Horizontal or Vertical returns to a flush join. Cancel writes nothing. An overlap is blended. A gap stays black. A slide past the edge fills the clear band from the nearest pixels. The file is an 8-bit TIFF named `{first}-{second}.tiff` in that folder. A taken name becomes `{name}-2.tiff` through `{name}-999.tiff`. The originals stay. A join that would pass about 40 million pixels is scaled, and the notice says so.
+Merge joins exactly two stills from the same folder. Horizontal or Vertical. The first clicked marked still is left or top when the anchor and the selection are two different marked stills. Otherwise the two marked stills are used in index order. Any other count says "Select two stills from this folder." The side button reads Preview until the join is open, then Merge. Merge stays off until both stills are read. Preview starts flush and replaces the grid. The picture is on black. Arrow keys, including Shift-arrow, move the second photo one pixel. Click zooms in. The panel says "Option-click". That click is Alt-click, and it zooms out and stops at fit. Space-drag moves the whole picture. Fit and 100% sit at the left of the strip above the picture. 100% is one image pixel per point, centered on the seam, and a second click recenters. Changing Horizontal or Vertical while the preview is open retargets that axis. Cancel writes nothing. An overlap is blended. A gap stays black. A slide past the edge fills the clear band from the nearest pixels. The file is an 8-bit TIFF named `{first}-{second}.tiff` in that folder. A taken name becomes `{name}-2.tiff` through `{name}-999.tiff`. The originals stay. A join that would pass about 40 million pixels is scaled, and the notice says so.
 
 Right-click a thumbnail. A still offers Edit Image, Show in Explorer, Open In, Copy settings, Paste settings, and a size line. A video offers Open, Play, Show in Explorer, Open With, the same copy and paste lines, and the size line. Play opens the in-app player. Open and Open With stay with the shell. After a merge preview is closed, Rename changes the clicked file's name in the same folder. Rename is hidden while the preview is up. An empty name, `.`, `..`, a slash, a colon, or a name the file system will not take is refused. A capitalization-only change is allowed. Paste keeps each destination crop. When the clicked file is already marked, paste applies to every marked still. Ctrl+right-click toggles the mark and leaves the menu closed. Image-view right-click zooms out, and is set aside while Select is armed.
 
@@ -115,7 +127,7 @@ The graph is display luminance, black on the left and white on the right. Shadow
 
 ### Tone
 
-Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Vibrance, and Saturation, then a hairline, then Texture, Clarity, Details, and Sharpness. Details uses radius coefficient 8. Sharpness is stored with geometry and shown here. Flatten sits to the left of Auto and Reset.
+Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Vibrance, and Saturation, then a hairline, then Texture, Clarity, Details, and Sharpness. Details uses radius coefficient 8. Sharpness is stored with geometry and shown here. The title row is Auto, Reset, Flatten. Flatten sits to the right of Reset.
 
 Flatten is available for an open still, including an empty edit list. It stays off for a video, the PDF page picker, and while Flatten or Export is writing. An empty library id asks before a duplicate TIFF. The first flatten asks with Yes, No, and Cancel. Yes writes `<stem>.zflat` beside the photograph, a TIFF, and keeps the edits. No writes the first free `<stem>-2.tiff` through `<stem>-999.tiff` and keeps the edits. Again asks "Flatten this photograph again?" Yes replaces the `.zflat` and clears the edit list. No restores the original and clears the edits. Cancel leaves both. The original file stays.
 
@@ -179,7 +191,7 @@ Print places one photograph on each page. Folder export uses the same formats fo
 
 Server reads the library on `\\192.168.1.147\BackupData\PhotoVideoAudio`. The helper answers TLS on `192.168.1.147` port 8742. The first answer pins the certificate. The pin is kept in `%LOCALAPPDATA%\ZImageWin\helper.ini`. Pair with Helper asks Windows to sign in to the share, then claims the pairing token. After a successful pair the token is stored with Windows data protection in `%LOCALAPPDATA%\ZImageWin\helper.auth`.
 
-Photos uses the same folder grid, paging, Find, and fold panels as Disk. Review and Duplicates still have code paths. Events and Reorganize are hidden. The date field and Set date sit at the bottom of the right column for Photos and Review. The path beside Rescan ends with the still count, as `(12345)`, once counting finishes. While the list is counting, the title says "Counting photos…".
+Photos uses the same folder grid and the same right-column stack as Disk, and adds Set date, Organize, and Clean inside Date. Review shows Preview and Date, with the date field and Set date. Duplicates keeps its side panel. Events and Reorganize are hidden. Rescan, the path, the name field, Find, and Clear filter sit on the center header, on the row above Preview size. The path beside Rescan ends with the still count, as `(12345)`, once counting finishes. While the list is counting, the page title says "Counting photos…". On `Photos\_Removed`, Delete ALL replaces the name field, Find, and Clear filter.
 
 While Server is selected, the toolbar shows the helper's current pass to the right of Server, for example "Making previews" or "Hashing previews". An empty phase hides the line. That read repeats every 10 seconds and does not start a scan. The health sentence stays in the center of an empty grid, for example "192.168.1.147   Helper online. Safe to reboot." Disk hides the pass line.
 
@@ -187,4 +199,4 @@ Organize, Clean, Rescan, Move, and Rename on Server show "… is left for a conf
 
 ## Limits
 
-Grades are linear sRGB on the CPU. TIFF and PNG are 8-bit. There is no DNG writer. An X3F opens the embedded JPEG. The Sigma sensor converter is not in this build. Object removal is absent. Graded video playback is silent. Disk Organize reads the page on screen. A PDF page opens on one click of its thumbnail. The window was not launched for this source update. The grade checks in `src\features.c` were compiled and printed `ok` on ARM64 and on x64.
+Grades are linear sRGB on the CPU. TIFF and PNG are 8-bit. There is no DNG writer. An X3F opens the embedded JPEG. The Sigma sensor converter is not in this build. Object removal is absent. Graded video playback is silent. Disk Organize reads the page on screen. A PDF page opens on one click of its thumbnail. The window was not launched for the 1.8.6.1 update. The grade checks in `src\features.c` were compiled and printed `ok` on ARM64 and on x64. No helper route that changes the library was sent. The NAS helper binary was left where it is.

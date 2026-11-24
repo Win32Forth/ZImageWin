@@ -15,9 +15,10 @@ static const wchar_t *const k_sections[ZI_SECTIONS] = {
 
 static int g_folder_tools_bottom;
 static wchar_t g_path_label[320];
-static wchar_t g_count_label[32];
-static wchar_t g_page_label[64];
-static wchar_t g_move_label[ZI_NAME];
+static wchar_t g_page_label[96];
+static wchar_t g_page_title[64];
+static wchar_t g_merge_caption[640];
+static wchar_t g_merge_offset[64];
 
 static const wchar_t *const k_library[3] = {
     L"Photos", L"Review", L"Duplicates"
@@ -771,135 +772,551 @@ static int zi_removed_folder(const ZiApp *app) {
     return _wcsicmp(parent, L"Photos") == 0;
 }
 
-static void zi_layout_folder_tools(ZiApp *app, HDC hdc) {
-    RECT column = app->regions.right;
-    int inset = zi_px(app, 12);
-    int gap = zi_px(app, 6);
-    int row_h = zi_px(app, 26);
-    int left = column.left + inset;
-    int width = (column.right - inset) - left;
-    int y = column.top + zi_px(app, 8);
-    int pages;
+static int zi_folder_stack(const ZiApp *app) {
+    if (!zi_showing_folder(app) || app->events_open || app->reorg_open) {
+        return 0;
+    }
+    if (app->source_server && app->library_section == 2) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Move, Merge, Build, and the page panel. Review keeps Preview and Date. */
+static int zi_folder_ops(const ZiApp *app) {
+    if (!zi_folder_stack(app)) {
+        return 0;
+    }
+    if (app->source_server && app->library_section != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void zi_comma_int(wchar_t *dest, size_t cap, int value) {
+    wchar_t raw[16];
+    wchar_t out[24];
+    int n;
+    int i;
+    int o = 0;
+    int lead;
+
+    if (value < 0) {
+        value = 0;
+    }
+    swprintf_s(raw, 16, L"%d", value);
+    n = (int)wcslen(raw);
+    lead = n % 3;
+    if (lead == 0) {
+        lead = 3;
+    }
+    for (i = 0; i < n && o + 2 < 24; i++) {
+        if (i > 0 && ((i - lead) % 3) == 0) {
+            out[o++] = L',';
+        }
+        out[o++] = raw[i];
+    }
+    out[o] = L'\0';
+    wcscpy_s(dest, cap, out);
+}
+
+static int zi_wrap_height(HDC hdc, HFONT font, const wchar_t *text, int width) {
+    RECT rc;
+    HFONT old;
+    int height;
+
+    if (!text || !text[0] || !hdc || width < 8) {
+        return 0;
+    }
+    rc.left = 0;
+    rc.top = 0;
+    rc.right = width;
+    rc.bottom = 1;
+    old = (HFONT)SelectObject(hdc, font);
+    height = DrawTextW(hdc, text, -1, &rc,
+                        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EXTERNALLEADING | DT_CALCRECT);
+    SelectObject(hdc, old);
+    if (height < 1) {
+        height = 1;
+    }
+    return height;
+}
+
+static void zi_shift_rect(RECT *rc, int dy) {
+    if (!rc || rc->right <= rc->left) {
+        return;
+    }
+    rc->top += dy;
+    rc->bottom += dy;
+}
+
+static void zi_hide_field(RECT *rc, const RECT *column) {
+    if (!rc || rc->right <= rc->left) {
+        return;
+    }
+    if (rc->top < column->top || rc->bottom > column->bottom) {
+        SetRectEmpty(rc);
+    }
+}
+
+static int zi_merge_pair(const ZiApp *app, const wchar_t **first, const wchar_t **second) {
+    int a = -1;
+    int b = -1;
+    int i;
+
+    if (app->merge_open && app->merge_a >= 0 && app->merge_a < app->file_count &&
+        app->merge_b >= 0 && app->merge_b < app->file_count) {
+        *first = app->files[app->merge_a].name;
+        *second = app->files[app->merge_b].name;
+        return 1;
+    }
+    if (app->file_anchor >= 0 && app->file_anchor < app->file_count && app->file_mark[app->file_anchor] &&
+        !app->files[app->file_anchor].video && app->file_selected >= 0 && app->file_selected < app->file_count &&
+        app->file_mark[app->file_selected] && !app->files[app->file_selected].video &&
+        app->file_anchor != app->file_selected) {
+        *first = app->files[app->file_anchor].name;
+        *second = app->files[app->file_selected].name;
+        return 1;
+    }
+    for (i = 0; i < app->file_count; i++) {
+        if (!app->file_mark[i] || app->files[i].video) {
+            continue;
+        }
+        if (a < 0) {
+            a = i;
+        } else if (b < 0) {
+            b = i;
+        } else {
+            return 0;
+        }
+    }
+    if (a < 0 || b < 0) {
+        return 0;
+    }
+    *first = app->files[a].name;
+    *second = app->files[b].name;
+    return 1;
+}
+
+static void zi_offset_caption(const ZiApp *app, wchar_t *dest, size_t cap) {
+    wchar_t part[2][32];
+    int n = 0;
+    int right = app->merge_shift_x;
+    int down = app->merge_shift_y;
+
+    if (right == 0 && down == 0) {
+        wcscpy_s(dest, cap, L"Flush");
+        return;
+    }
+    if (right > 0) {
+        swprintf_s(part[n++], 32, L"%d right", right);
+    } else if (right < 0) {
+        swprintf_s(part[n++], 32, L"%d left", -right);
+    }
+    if (down > 0) {
+        swprintf_s(part[n++], 32, L"%d down", down);
+    } else if (down < 0) {
+        swprintf_s(part[n++], 32, L"%d up", -down);
+    }
+    if (n == 2) {
+        swprintf_s(dest, cap, L"%s, %s", part[0], part[1]);
+    } else if (n == 1) {
+        wcscpy_s(dest, cap, part[0]);
+    } else {
+        dest[0] = L'\0';
+    }
+}
+
+static void zi_add_wrapped(ZiApp *app, int x, int y, int width, const wchar_t *text, HDC hdc) {
+    int height = zi_wrap_height(hdc, app->font, text, width);
+
+    if (height < 1) {
+        return;
+    }
+    zi_add(app, ZI_ID_NONE, 6, 0, 0, zi_row(x, y, width, height), text);
+}
+
+static void zi_add_rule(ZiApp *app, int x, int y, int width) {
+    zi_add(app, ZI_ID_NONE, 7, 0, 0, zi_row(x, y, width, 1), NULL);
+}
+
+static void zi_layout_folder_header(ZiApp *app, HDC hdc) {
+    RECT canvas = app->regions.canvas;
+    int pad = zi_px(app, 16);
+    int gap = zi_px(app, 8);
+    int y;
+    int h;
+    int right;
+    int x;
+    int find_w;
+    int clear_w;
+    int name_w;
     wchar_t dir[MAX_PATH];
 
-    (void)hdc;
-    g_folder_tools_bottom = column.top;
+    SetRectEmpty(&app->filter_field);
     g_path_label[0] = L'\0';
-    g_count_label[0] = L'\0';
+    /* The join replaces the folder grid, including its header. */
+    if (!zi_folder_stack(app) || !zi_grid_active(app) || app->merge_open) {
+        return;
+    }
+    if (app->source_server) {
+        y = canvas.top + zi_px(app, 10);
+        h = zi_px(app, 28);
+    } else {
+        y = canvas.top + zi_px(app, 8);
+        h = zi_px(app, 26);
+    }
+    right = canvas.right - pad;
+    find_w = zi_button_width(app, hdc, L"Find");
+    clear_w = zi_button_width(app, hdc, L"Clear filter");
+    name_w = zi_px(app, 168);
+    if (app->source_server && zi_removed_folder(app)) {
+        int delete_w = zi_button_width(app, hdc, L"Delete ALL");
+        int rescan_w = zi_button_width(app, hdc, L"Rescan");
+
+        zi_add(app, ZI_ID_RESCAN, 0, 1, 0, zi_row(canvas.left + pad, y, rescan_w, h), L"Rescan");
+        zi_add(app, ZI_ID_DELETE_ALL, 0, 1, 0, zi_row(right - delete_w, y, delete_w, h), L"Delete ALL");
+        x = canvas.left + pad + rescan_w + gap;
+        if (zi_current_folder(app, dir, MAX_PATH)) {
+            if (app->file_reading) {
+                wcscpy_s(g_path_label, 320, dir);
+            } else {
+                wchar_t num[24];
+
+                zi_comma_int(num, 24, zi_grid_still_total(app));
+                swprintf_s(g_path_label, 320, L"%s (%s)", dir, num);
+            }
+            zi_add(app, ZI_ID_NONE, 4, 0, 0, zi_row(x, y, right - delete_w - gap - x, h), g_path_label);
+        }
+        return;
+    }
+    if (!app->source_server) {
+        int label_w = zi_text_width(hdc, app->font, L"Preview size") + zi_px(app, 8);
+        int used = canvas.left + pad + label_w + zi_px(app, 140) + zi_px(app, 8) + zi_px(app, 56) + zi_px(app, 12);
+        int room = right - used - gap - find_w - gap - clear_w;
+
+        if (room < name_w) {
+            name_w = room;
+        }
+        if (name_w < zi_px(app, 48)) {
+            name_w = zi_px(app, 48);
+        }
+    }
+    x = right - clear_w;
+    zi_add(app, ZI_ID_CLEAR_FILTER, 0, 1, 0, zi_row(x, y, clear_w, h), L"Clear filter");
+    x -= gap + find_w;
+    zi_add(app, ZI_ID_FIND, 0, 1, 0, zi_row(x, y, find_w, h), L"Find");
+    x -= gap + name_w;
+    app->filter_field = zi_row(x, y, name_w, h);
+    if (app->source_server) {
+        int rescan_w = zi_button_width(app, hdc, L"Rescan");
+        int path_x = canvas.left + pad + rescan_w + gap;
+
+        zi_add(app, ZI_ID_RESCAN, 0, 1, 0, zi_row(canvas.left + pad, y, rescan_w, h), L"Rescan");
+        if (zi_current_folder(app, dir, MAX_PATH)) {
+            if (!app->file_reading) {
+                wchar_t num[24];
+
+                zi_comma_int(num, 24, zi_grid_still_total(app));
+                swprintf_s(g_path_label, 320, L"%s (%s)", dir, num);
+            } else {
+                wcscpy_s(g_path_label, 320, dir);
+            }
+            if (x - gap > path_x) {
+                zi_add(app, ZI_ID_NONE, 4, 0, 0, zi_row(path_x, y, x - gap - path_x, h), g_path_label);
+            }
+        }
+    }
+}
+
+static void zi_layout_folder_tools(ZiApp *app, HDC hdc) {
+    RECT column = app->regions.right;
+    int inset = zi_px(app, 16);
+    int gap = zi_px(app, 8);
+    int row_h = zi_px(app, 28);
+    int left = column.left + inset;
+    int width = (column.right - inset) - left;
+    int full = column.right - column.left;
+    int y = 0;
+    int begin;
+    int i;
+    int view;
+    int dy;
+    const wchar_t *move_title = L"Move selected files to specified Folder";
+
+    g_folder_tools_bottom = 0;
     g_page_label[0] = L'\0';
+    g_page_title[0] = L'\0';
+    g_merge_caption[0] = L'\0';
+    g_merge_offset[0] = L'\0';
+    SetRectEmpty(&app->date_field);
+    SetRectEmpty(&app->move_field);
+    SetRectEmpty(&app->preview_well);
+    SetRectEmpty(&app->facts_rc);
+    if (!zi_folder_stack(app)) {
+        app->detail_content = 0;
+        return;
+    }
     if (width < zi_px(app, 40)) {
         width = zi_px(app, 40);
     }
-    if (app->file_reading) {
-        wcscpy_s(g_path_label, 320, L"Counting photos\u2026");
-    } else if (zi_current_folder(app, dir, MAX_PATH)) {
-        wcscpy_s(g_path_label, 320, dir);
-        if (app->source_server) {
-            swprintf_s(g_count_label, 32, L"(%d)", zi_grid_still_total(app));
-        }
-    }
-    if (app->source_server) {
-        int rescan_w = zi_px(app, 72);
-        int count_w = g_count_label[0] ? zi_px(app, 72) : 0;
-
-        zi_add(app, ZI_ID_RESCAN, 0, 1, 0, zi_row(left, y, rescan_w, row_h), L"Rescan");
-        zi_add(app, ZI_ID_NONE, 4, 0, 0,
-               zi_row(left + rescan_w + gap, y, width - rescan_w - gap - count_w, row_h), g_path_label);
-        if (count_w) {
-            zi_add(app, ZI_ID_NONE, 5, 0, 0,
-                   zi_row(left + width - count_w, y, count_w, row_h), g_count_label);
-        }
-    } else if (g_path_label[0]) {
-        zi_add(app, ZI_ID_NONE, 4, 0, 0, zi_row(left, y, width, row_h), g_path_label);
-    }
-    y += row_h + gap;
-    if (zi_removed_folder(app)) {
-        zi_add(app, ZI_ID_DELETE_ALL, 0, 1, 0, zi_row(left, y, width, row_h), L"Delete ALL");
-        y += row_h + gap;
-    } else {
-        int half = (width - gap) / 2;
-
-        zi_add(app, ZI_ID_FIND, 0, 1, 0, zi_row(left, y, half, row_h), L"Find");
-        zi_add(app, ZI_ID_CLEAR_FILTER, 0, app->name_filter[0] != L'\0', 0,
-               zi_row(left + half + gap, y, width - half - gap, row_h), L"Clear");
-        y += row_h + gap;
-    }
-    pages = zi_grid_page_count(app);
-    if (pages > 1) {
-        int cell = (width - gap * 3) / 4;
+    begin = app->ctrl_count;
+    if (zi_folder_ops(app) && zi_grid_page_count(app) > 1) {
+        ZiPageSlice slice;
         int page = app->file_page;
+        int pages = zi_grid_page_count(app);
+        int on_page;
+        int start;
+        wchar_t first_n[24];
+        wchar_t last_n[24];
+        wchar_t total_n[24];
+        int cell = (width - gap) / 2;
 
         if (page < 0) {
             page = 0;
         }
-        zi_add(app, ZI_ID_PAGE_FIRST, 0, page > 0, 0, zi_row(left, y, cell, row_h), L"First");
-        zi_add(app, ZI_ID_PAGE_PREV, 0, page > 0, 0, zi_row(left + cell + gap, y, cell, row_h), L"Prev 200");
-        zi_add(app, ZI_ID_PAGE_NEXT, 0, page + 1 < pages, 0,
-               zi_row(left + (cell + gap) * 2, y, cell, row_h), L"Next 200");
-        zi_add(app, ZI_ID_PAGE_LAST, 0, page + 1 < pages, 0,
-               zi_row(left + (cell + gap) * 3, y, width - (cell + gap) * 3, row_h), L"Last");
-        y += row_h;
-        swprintf_s(g_page_label, 64, L"Page %d of %d", page + 1, pages);
-        zi_add(app, ZI_ID_NONE, 4, 0, 0, zi_row(left, y, width, zi_px(app, 18)), g_page_label);
-        y += zi_px(app, 18) + gap;
-    }
-    zi_add(app, ZI_ID_FOLD_DATE, 0, 1, app->fold_date, zi_row(left, y, width, row_h), L"Date");
-    y += row_h + gap;
-    if (app->fold_date) {
-        int half = (width - gap) / 2;
-
-        zi_add(app, ZI_ID_ORGANIZE, 0, 1, 0, zi_row(left, y, half, row_h), L"Organize");
-        zi_add(app, ZI_ID_CLEAN_DATE, 0, 1, 0, zi_row(left + half + gap, y, width - half - gap, row_h), L"Clean");
-        y += row_h + gap;
-    }
-    zi_add(app, ZI_ID_FOLD_MOVE, 0, 1, app->fold_move, zi_row(left, y, width, row_h), L"Move");
-    y += row_h + gap;
-    if (app->fold_move) {
-        if (app->move_name[0]) {
-            wcscpy_s(g_move_label, ZI_NAME, app->move_name);
+        y += inset;
+        if (app->file_reading) {
+            wcscpy_s(g_page_title, 64, L"Counting photos\u2026");
         } else {
-            wcscpy_s(g_move_label, ZI_NAME, L"Folder");
+            zi_comma_int(first_n, 24, zi_grid_still_total(app));
+            swprintf_s(g_page_title, 64, L"%s photos", first_n);
         }
-        zi_add(app, ZI_ID_NONE, 4, 0, 0, zi_row(left, y, width, zi_px(app, 18)),
-               L"Move selected files to specified Folder");
-        y += zi_px(app, 18);
-        zi_add(app, ZI_ID_MOVE_NAME, 0, 1, 0, zi_row(left, y, width, row_h), g_move_label);
-        y += row_h + gap;
-        zi_add(app, ZI_ID_MOVE_SUB, 0, 1, app->move_sub, zi_row(left, y, width, row_h),
-               L"Sub-folder of this folder");
-        y += row_h + gap;
-        zi_add(app, ZI_ID_MOVE_GO, 0, app->move_name[0] != L'\0', 0, zi_row(left, y, width, row_h),
-               L"Move to Folder");
-        y += row_h + gap;
+        zi_add(app, ZI_ID_FOLD_PAGE, 0, 1, app->fold_page, zi_row(left, y, width, row_h), g_page_title);
+        y += row_h;
+        if (app->fold_page) {
+            y += gap;
+            zi_page_slice(page, app->file_still_total, app->file_filtered, app->file_match_total, &slice);
+            on_page = app->file_filtered ? slice.filtered_count : slice.still_count;
+            start = (app->file_filtered ? slice.filtered_begin : slice.still_begin) + 1;
+            if (on_page > 0) {
+                int range_h;
+
+                zi_comma_int(first_n, 24, start);
+                zi_comma_int(last_n, 24, start + on_page - 1);
+                if (app->file_reading) {
+                    swprintf_s(g_page_label, 96, L"%s\u2013%s", first_n, last_n);
+                } else {
+                    zi_comma_int(total_n, 24, app->file_filtered ? app->file_match_total : app->file_still_total);
+                    swprintf_s(g_page_label, 96, L"%s\u2013%s of %s", first_n, last_n, total_n);
+                }
+                range_h = zi_wrap_height(hdc, app->font, g_page_label, width);
+                if (range_h < zi_px(app, 18)) {
+                    range_h = zi_px(app, 18);
+                }
+                zi_add(app, ZI_ID_NONE, 6, 0, 0, zi_row(left, y, width, range_h), g_page_label);
+                y += range_h + gap;
+            }
+            zi_add(app, ZI_ID_PAGE_FIRST, 0, page > 0, 0, zi_row(left, y, cell, row_h), L"First");
+            zi_add(app, ZI_ID_PAGE_PREV, 0, page > 0, 0, zi_row(left + cell + gap, y, width - cell - gap, row_h), L"Prev 200");
+            y += row_h + gap;
+            zi_add(app, ZI_ID_PAGE_NEXT, 0, page + 1 < pages, 0, zi_row(left, y, cell, row_h), L"Next 200");
+            zi_add(app, ZI_ID_PAGE_LAST, 0, page + 1 < pages, 0,
+                   zi_row(left + cell + gap, y, width - cell - gap, row_h), L"Last");
+            y += row_h;
+        }
+        y += inset;
+        zi_add_rule(app, column.left, y, full);
+        y += 1;
     }
-    zi_add(app, ZI_ID_FOLD_MERGE, 0, 1, app->fold_merge, zi_row(left, y, width, row_h), L"Merge two photos");
-    y += row_h + gap;
-    if (app->fold_merge) {
+    y += inset;
+    zi_add(app, ZI_ID_FOLD_PREVIEW, 0, 1, app->fold_preview, zi_row(left, y, width, row_h), L"Preview");
+    y += row_h;
+    if (app->fold_preview) {
+        RECT probe = zi_row(left, y + gap, width, 1);
+        int well = zi_editor_preview_well(app, hdc, &probe, 0);
+
+        if (well > 0) {
+            y += gap;
+            app->preview_well = zi_row(left, y, width, well);
+            y += well;
+        }
+    }
+    y += inset;
+    zi_add_rule(app, column.left, y, full);
+    y += 1;
+    y += inset;
+    zi_add(app, ZI_ID_FOLD_DATE, 0, 1, app->fold_date, zi_row(left, y, width, row_h), L"Date");
+    y += row_h;
+    if (app->fold_date) {
+        RECT probe = zi_row(left, y + gap, width, 1);
+        int facts = hdc ? zi_editor_date_facts(app, hdc, &probe, 0) : zi_px(app, 18);
+
+        y += gap;
+        if (facts > 0) {
+            app->facts_rc = zi_row(left, y, width, facts);
+            y += facts + gap;
+        }
+        if (zi_library_date_visible(app)) {
+            app->date_field = zi_row(left, y, width, row_h);
+            y += row_h + gap;
+            zi_add(app, ZI_ID_SET_DATE, 0, 1, 0, zi_row(left, y, width, row_h), L"Set date");
+            y += row_h;
+            if (app->source_server && app->library_section == 0) {
+                y += gap;
+                zi_add(app, ZI_ID_ORGANIZE, 0, 1, 0, zi_row(left, y, width, row_h), L"Organize");
+                y += row_h + gap;
+                zi_add(app, ZI_ID_CLEAN_DATE, 0, 1, 0, zi_row(left, y, width, row_h), L"Clean");
+                y += row_h;
+            }
+        }
+    }
+    y += inset;
+    if (zi_folder_ops(app)) {
+        int title_w = width - zi_px(app, 28) - zi_px(app, 8);
+        int title_h = zi_wrap_height(hdc, app->font, move_title, title_w);
+        const wchar_t *intro;
+        const wchar_t *first = NULL;
+        const wchar_t *second = NULL;
         int half = (width - gap) / 2;
 
-        zi_add(app, ZI_ID_MERGE_H, 0, 1, app->merge_open && !app->merge_vertical,
-               zi_row(left, y, half, row_h), L"Horizontal");
-        zi_add(app, ZI_ID_MERGE_V, 0, 1, app->merge_open && app->merge_vertical,
-               zi_row(left + half + gap, y, width - half - gap, row_h), L"Vertical");
-        y += row_h + gap;
-        if (app->merge_open) {
-            int cell = (width - gap * 3) / 4;
-
-            zi_add(app, ZI_ID_MERGE_FIT, 0, 1, 0, zi_row(left, y, cell, row_h), L"Fit");
-            zi_add(app, ZI_ID_MERGE_FULL, 0, 1, 0, zi_row(left + cell + gap, y, cell, row_h), L"100%");
-            zi_add(app, ZI_ID_MERGE_OK, 0, 1, 0, zi_row(left + (cell + gap) * 2, y, cell, row_h), L"OK");
-            zi_add(app, ZI_ID_MERGE_CANCEL, 0, 1, 0,
-                   zi_row(left + (cell + gap) * 3, y, width - (cell + gap) * 3, row_h), L"Cancel");
-            y += row_h + gap;
+        if (title_h < row_h) {
+            title_h = row_h;
+        } else {
+            title_h += zi_px(app, 8);
         }
+        zi_add_rule(app, column.left, y, full);
+        y += 1;
+        y += inset;
+        zi_add(app, ZI_ID_FOLD_MOVE, 0, 1, app->fold_move, zi_row(left, y, width, title_h), move_title);
+        y += title_h;
+        if (app->fold_move) {
+            y += gap;
+            app->move_field = zi_row(left, y, width, row_h);
+            y += row_h + gap;
+            zi_add(app, ZI_ID_MOVE_SUB, 0, 1, app->move_sub, zi_row(left, y, width, row_h),
+                   L"Sub-folder of this folder");
+            y += row_h + gap;
+            zi_add(app, ZI_ID_MOVE_GO, 0, 1, 0, zi_row(left, y, width, row_h), L"Move to Folder");
+            y += row_h;
+        }
+        y += inset;
+        zi_add_rule(app, column.left, y, full);
+        y += 1;
+        y += inset;
+        zi_add(app, ZI_ID_FOLD_MERGE, 0, 1, app->fold_merge, zi_row(left, y, width, row_h), L"Merge two photos");
+        y += row_h;
+        if (app->fold_merge) {
+            y += gap;
+            intro = app->merge_open
+                ? L"The first photo is the left or the top. Merge saves the TIFF in this folder."
+                : L"The first photo selected is the left or the top. The second is the right or the bottom. Preview shows the join, then Merge saves the TIFF in this folder.";
+            zi_add_wrapped(app, left, y, width, intro, hdc);
+            y += zi_wrap_height(hdc, app->font, intro, width) + gap;
+            zi_add(app, ZI_ID_MERGE_H, 0, 1, !app->merge_vertical, zi_row(left, y, half, row_h), L"Horizontal");
+            zi_add(app, ZI_ID_MERGE_V, 0, 1, app->merge_vertical, zi_row(left + half + gap, y, width - half - gap, row_h),
+                   L"Vertical");
+            y += row_h + gap;
+            if (zi_merge_pair(app, &first, &second)) {
+                if (app->merge_vertical) {
+                    swprintf_s(g_merge_caption, 640, L"Top: %s. Bottom: %s.", first, second);
+                } else {
+                    swprintf_s(g_merge_caption, 640, L"Left: %s. Right: %s.", first, second);
+                }
+            } else {
+                wcscpy_s(g_merge_caption, 640, L"Select two photos.");
+            }
+            zi_add_wrapped(app, left, y, width, g_merge_caption, hdc);
+            y += zi_wrap_height(hdc, app->font, g_merge_caption, width) + gap;
+            if (app->merge_open) {
+                const wchar_t *hint =
+                    L"Arrow keys move the second photo. Click zooms in. Option-click zooms out. Hold Space and drag to move the view.";
+
+                zi_add_wrapped(app, left, y, width, hint, hdc);
+                y += zi_wrap_height(hdc, app->font, hint, width) + gap;
+                zi_offset_caption(app, g_merge_offset, 64);
+                {
+                    int offset_h = zi_wrap_height(hdc, app->font, g_merge_offset, width);
+
+                    if (offset_h < zi_px(app, 18)) {
+                        offset_h = zi_px(app, 18);
+                    }
+                    zi_add(app, ZI_ID_NONE, 6, 0, 0, zi_row(left, y, width, offset_h), g_merge_offset);
+                    y += offset_h + gap;
+                }
+                zi_add(app, ZI_ID_MERGE_OK, 0, zi_merge_ready(), 0, zi_row(left, y, half, row_h), L"Merge");
+                zi_add(app, ZI_ID_MERGE_CANCEL, 0, 1, 0, zi_row(left + half + gap, y, width - half - gap, row_h), L"Cancel");
+                y += row_h;
+            } else {
+                zi_add(app, ZI_ID_MERGE_OK, 0, first != NULL, 0, zi_row(left, y, width, row_h), L"Preview");
+                y += row_h;
+            }
+        }
+        y += inset;
+        zi_add_rule(app, column.left, y, full);
+        y += 1;
+        y += inset;
+        zi_add(app, ZI_ID_FOLD_BUILD, 0, 1, app->fold_build, zi_row(left, y, width, row_h), L"Build previews");
+        y += row_h;
+        if (app->fold_build) {
+            const wchar_t *build_intro = L"Builds a preview for each photo in this folder that does not have one.";
+
+            y += gap;
+            zi_add_wrapped(app, left, y, width, build_intro, hdc);
+            y += zi_wrap_height(hdc, app->font, build_intro, width);
+            if (app->build_note[0]) {
+                y += gap;
+                zi_add_wrapped(app, left, y, width, app->build_note, hdc);
+                y += zi_wrap_height(hdc, app->font, app->build_note, width);
+            }
+            y += gap;
+            zi_add(app, ZI_ID_BUILD_PREV, 0, 1, 0, zi_row(left, y, width, row_h), L"Build");
+            y += row_h;
+        }
+        y += inset;
     }
-    zi_add(app, ZI_ID_FOLD_BUILD, 0, 1, app->fold_build, zi_row(left, y, width, row_h), L"Build previews");
-    y += row_h + gap;
-    if (app->fold_build) {
-        zi_add(app, ZI_ID_BUILD_PREV, 0, 1, 0, zi_row(left, y, width, row_h), L"Build previews");
-        y += row_h + gap;
+    app->detail_content = y;
+    view = column.bottom - column.top;
+    if (view < 1) {
+        view = 1;
     }
-    g_folder_tools_bottom = y;
+    if (app->detail_scroll > y - view) {
+        app->detail_scroll = y - view;
+    }
+    if (app->detail_scroll < 0) {
+        app->detail_scroll = 0;
+    }
+    dy = column.top - app->detail_scroll;
+    for (i = begin; i < app->ctrl_count; i++) {
+        zi_shift_rect(&app->ctrls[i].rc, dy);
+    }
+    zi_shift_rect(&app->preview_well, dy);
+    zi_shift_rect(&app->facts_rc, dy);
+    zi_shift_rect(&app->date_field, dy);
+    zi_shift_rect(&app->move_field, dy);
+    zi_hide_field(&app->date_field, &column);
+    zi_hide_field(&app->move_field, &column);
+    g_folder_tools_bottom = column.bottom;
+}
+
+/* Fit and 100% sit on the join, in the strip above the picture. */
+static void zi_layout_merge_bar(ZiApp *app, HDC hdc) {
+    RECT canvas;
+    int pad;
+    int gap;
+    int y;
+    int h;
+    int x;
+    int fit_w;
+    int full_w;
+
+    if (!app->merge_open || !zi_showing_folder(app) || app->events_open || app->reorg_open) {
+        return;
+    }
+    canvas = app->regions.canvas;
+    pad = zi_px(app, 16);
+    gap = zi_px(app, 8);
+    y = canvas.top + zi_px(app, 8);
+    h = zi_px(app, 28);
+    if (y + h > canvas.bottom) {
+        return;
+    }
+    x = canvas.left + pad;
+    fit_w = zi_button_width(app, hdc, L"Fit");
+    full_w = zi_button_width(app, hdc, L"100%");
+    zi_add(app, ZI_ID_MERGE_FIT, 0, 1, 0, zi_row(x, y, fit_w, h), L"Fit");
+    x += fit_w + gap;
+    zi_add(app, ZI_ID_MERGE_FULL, 0, 1, 0, zi_row(x, y, full_w, h), L"100%");
 }
 
 static void zi_layout_inspector(ZiApp *app, HDC hdc) {
@@ -947,7 +1364,11 @@ static void zi_layout_inspector(ZiApp *app, HDC hdc) {
             RECT auto_rc;
             RECT reset_rc;
 
-            reset_rc.right = column.right - zi_px(app, 28);
+            flat_rc.right = column.right - zi_px(app, 28);
+            flat_rc.left = flat_rc.right - zi_px(app, 70);
+            flat_rc.top = top;
+            flat_rc.bottom = top + button_h;
+            reset_rc.right = flat_rc.left - gap;
             reset_rc.left = reset_rc.right - zi_px(app, 62);
             reset_rc.top = top;
             reset_rc.bottom = top + button_h;
@@ -955,10 +1376,6 @@ static void zi_layout_inspector(ZiApp *app, HDC hdc) {
             auto_rc.left = auto_rc.right - zi_px(app, 54);
             auto_rc.top = top;
             auto_rc.bottom = top + button_h;
-            flat_rc.right = auto_rc.left - gap;
-            flat_rc.left = flat_rc.right - zi_px(app, 70);
-            flat_rc.top = top;
-            flat_rc.bottom = top + button_h;
             zi_add(app, ZI_ID_FLATTEN, 0, zi_editor_can_flatten(app), 0, flat_rc, L"Flatten");
             zi_add(app, ZI_ID_AUTO, 0, app->photo && !app->photo_failed, 0, auto_rc, L"Auto");
             zi_add(app, ZI_ID_RESET, 0, zi_editor_can_reset(app), 0, reset_rc, L"Reset");
@@ -1125,6 +1542,11 @@ void zi_chrome_layout(ZiApp *app, HDC hdc, const RECT *client) {
 
     app->ctrl_count = 0;
     g_folder_tools_bottom = 0;
+    SetRectEmpty(&app->filter_field);
+    SetRectEmpty(&app->date_field);
+    SetRectEmpty(&app->move_field);
+    SetRectEmpty(&app->preview_well);
+    SetRectEmpty(&app->facts_rc);
     top = client->top + toolbar;
     app->regions.toolbar = zi_row(client->left, client->top, width, toolbar);
     app->regions.right = zi_row(client->right - right, top, right, client->bottom - top);
@@ -1149,6 +1571,8 @@ void zi_chrome_layout(ZiApp *app, HDC hdc, const RECT *client) {
     zi_layout_inspector(app, hdc);
     if (zi_showing_folder(app)) {
         zi_layout_folder_tools(app, hdc);
+        zi_layout_folder_header(app, hdc);
+        zi_layout_merge_bar(app, hdc);
     }
     zi_library_layout(app);
     zi_grid_sync_bar(app);
@@ -1630,13 +2054,36 @@ int zi_curve_point_at(const ZiApp *app, int x, int y, int *index, double *nx, do
 
 static void zi_paint_fold(ZiApp *app, HDC hdc, const ZiCtrl *ctrl) {
     RECT text = ctrl->rc;
+    int tall = (ctrl->rc.bottom - ctrl->rc.top) > zi_px(app, 34);
+    int cx = ctrl->rc.right - zi_px(app, 14);
+    int cy;
     HBRUSH fill = ctrl->selected ? app->select_brush : app->button_brush;
+    HGDIOBJ old;
 
     FillRect(hdc, &ctrl->rc, fill);
-    zi_paint_chevron(app, hdc, ctrl->rc.left + zi_px(app, 8), (ctrl->rc.top + ctrl->rc.bottom) / 2, ctrl->selected);
-    text.left += zi_px(app, 22);
-    text.right -= zi_px(app, 6);
-    zi_text(hdc, app->font, ZI_INK, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, ctrl->label);
+    text.left += zi_px(app, 8);
+    text.right -= zi_px(app, 28);
+    if (tall) {
+        text.top += zi_px(app, 4);
+        text.bottom -= zi_px(app, 4);
+        cy = text.top + zi_px(app, 8);
+        zi_text(hdc, app->font, ZI_INK, text, DT_LEFT | DT_TOP | DT_WORDBREAK, ctrl->label);
+    } else {
+        cy = (ctrl->rc.top + ctrl->rc.bottom) / 2;
+        zi_text(hdc, app->font, ZI_INK, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, ctrl->label);
+    }
+    /* Open points down. Collapsed points up. The mark stays at the right end of the title. */
+    old = SelectObject(hdc, app->ink_pen);
+    if (ctrl->selected) {
+        MoveToEx(hdc, cx - zi_px(app, 5), cy - zi_px(app, 2), NULL);
+        LineTo(hdc, cx, cy + zi_px(app, 3));
+        LineTo(hdc, cx + zi_px(app, 5), cy - zi_px(app, 2));
+    } else {
+        MoveToEx(hdc, cx - zi_px(app, 5), cy + zi_px(app, 2), NULL);
+        LineTo(hdc, cx, cy - zi_px(app, 3));
+        LineTo(hdc, cx + zi_px(app, 5), cy + zi_px(app, 2));
+    }
+    SelectObject(hdc, old);
 }
 
 static void zi_paint_history_row(ZiApp *app, HDC hdc, const ZiCtrl *ctrl) {
@@ -1973,8 +2420,6 @@ static int zi_right_control(int id) {
     case ZI_ID_CURVE_MOODY:
     case ZI_ID_CURVE_PUNCH:
     case ZI_ID_CURVE_LOFI:
-    case ZI_ID_FIND:
-    case ZI_ID_CLEAR_FILTER:
     case ZI_ID_PAGE_FIRST:
     case ZI_ID_PAGE_PREV:
     case ZI_ID_PAGE_NEXT:
@@ -1986,13 +2431,12 @@ static int zi_right_control(int id) {
     case ZI_ID_MERGE_V:
     case ZI_ID_MERGE_OK:
     case ZI_ID_MERGE_CANCEL:
-    case ZI_ID_MERGE_FIT:
-    case ZI_ID_MERGE_FULL:
     case ZI_ID_ORGANIZE:
     case ZI_ID_CLEAN_DATE:
-    case ZI_ID_RESCAN:
     case ZI_ID_BUILD_PREV:
-    case ZI_ID_DELETE_ALL:
+    case ZI_ID_SET_DATE:
+    case ZI_ID_FOLD_PREVIEW:
+    case ZI_ID_FOLD_PAGE:
     case ZI_ID_FOLD_DATE:
     case ZI_ID_FOLD_MOVE:
     case ZI_ID_FOLD_MERGE:
@@ -2003,32 +2447,50 @@ static int zi_right_control(int id) {
     }
 }
 
+static int zi_column_hit(const RECT *column, const RECT *rc) {
+    POINT mid;
+
+    mid.x = (rc->left + rc->right) / 2;
+    mid.y = (rc->top + rc->bottom) / 2;
+    return PtInRect(column, mid);
+}
+
 static void zi_paint_folder_tools(ZiApp *app, HDC hdc) {
+    RECT column = app->regions.right;
     int i;
 
     for (i = 0; i < app->ctrl_count; i++) {
         ZiCtrl *row = &app->ctrls[i];
 
-        if (row->id == ZI_ID_NONE && (row->extra == 4 || row->extra == 5) && row->label) {
+        if (!zi_column_hit(&column, &row->rc)) {
+            continue;
+        }
+        if (row->id == ZI_ID_NONE && row->extra == 7) {
+            HGDIOBJ old = SelectObject(hdc, app->hair);
+
+            MoveToEx(hdc, row->rc.left, row->rc.top, NULL);
+            LineTo(hdc, row->rc.right, row->rc.top);
+            SelectObject(hdc, old);
+        } else if (row->id == ZI_ID_NONE && row->extra == 6 && row->label) {
+            zi_text(hdc, app->font, ZI_INK, row->rc, DT_LEFT | DT_TOP | DT_WORDBREAK, row->label);
+        } else if (row->id == ZI_ID_NONE && (row->extra == 4 || row->extra == 5) && row->label) {
             UINT format = row->extra == 5 ? DT_RIGHT : DT_LEFT;
 
             zi_text(hdc, app->font, ZI_MUTED, row->rc,
                     format | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, row->label);
-        } else if (row->id == ZI_ID_FOLD_DATE || row->id == ZI_ID_FOLD_MOVE ||
+        } else if (row->id == ZI_ID_FOLD_PREVIEW || row->id == ZI_ID_FOLD_PAGE ||
+                   row->id == ZI_ID_FOLD_DATE || row->id == ZI_ID_FOLD_MOVE ||
                    row->id == ZI_ID_FOLD_MERGE || row->id == ZI_ID_FOLD_BUILD) {
             zi_paint_fold(app, hdc, row);
         } else if (row->id == ZI_ID_MOVE_SUB) {
             zi_paint_checkbox(app, hdc, row);
-        } else if (row->id == ZI_ID_FIND || row->id == ZI_ID_CLEAR_FILTER ||
-                   row->id == ZI_ID_PAGE_FIRST || row->id == ZI_ID_PAGE_PREV ||
+        } else if (row->id == ZI_ID_PAGE_FIRST || row->id == ZI_ID_PAGE_PREV ||
                    row->id == ZI_ID_PAGE_NEXT || row->id == ZI_ID_PAGE_LAST ||
                    row->id == ZI_ID_MOVE_GO || row->id == ZI_ID_MOVE_NAME ||
                    row->id == ZI_ID_MERGE_H || row->id == ZI_ID_MERGE_V ||
                    row->id == ZI_ID_MERGE_OK || row->id == ZI_ID_MERGE_CANCEL ||
-                   row->id == ZI_ID_MERGE_FIT || row->id == ZI_ID_MERGE_FULL ||
                    row->id == ZI_ID_ORGANIZE || row->id == ZI_ID_CLEAN_DATE ||
-                   row->id == ZI_ID_RESCAN || row->id == ZI_ID_BUILD_PREV ||
-                   row->id == ZI_ID_DELETE_ALL) {
+                   row->id == ZI_ID_BUILD_PREV || row->id == ZI_ID_SET_DATE) {
             zi_paint_button(app, hdc, row);
         }
     }
@@ -2047,12 +2509,15 @@ static void zi_paint_right(ZiApp *app, HDC hdc) {
             return;
         }
         saved = SaveDC(hdc);
-        if (g_folder_tools_bottom > column.top) {
-            IntersectClipRect(hdc, column.left, g_folder_tools_bottom, column.right, column.bottom);
+        IntersectClipRect(hdc, column.left, column.top, column.right, column.bottom);
+        if (app->fold_preview && app->preview_well.right > app->preview_well.left) {
+            zi_editor_preview_well(app, hdc, &app->preview_well, 1);
         }
-        zi_editor_paint_details(app, hdc);
-        RestoreDC(hdc, saved);
+        if (app->fold_date && app->facts_rc.right > app->facts_rc.left) {
+            zi_editor_date_facts(app, hdc, &app->facts_rc, 1);
+        }
         zi_paint_folder_tools(app, hdc);
+        RestoreDC(hdc, saved);
         zi_library_paint_side(app, hdc);
         return;
     }
@@ -2165,7 +2630,15 @@ static void zi_paint_controls(ZiApp *app, HDC hdc) {
     for (i = 0; i < app->ctrl_count; i++) {
         ZiCtrl *ctrl = &app->ctrls[i];
 
-        if (ctrl->id == ZI_ID_NONE && ctrl->extra == 2 && ctrl->label) {
+        if (ctrl->id == ZI_ID_NONE && ctrl->extra == 4 && ctrl->label &&
+            ctrl->rc.left < app->regions.right.left) {
+            zi_text(hdc, app->font, ZI_INK, ctrl->rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS | DT_NOPREFIX, ctrl->label);
+        } else if (ctrl->id == ZI_ID_FIND || ctrl->id == ZI_ID_CLEAR_FILTER ||
+                   ctrl->id == ZI_ID_RESCAN || ctrl->id == ZI_ID_DELETE_ALL ||
+                   ctrl->id == ZI_ID_MERGE_FIT || ctrl->id == ZI_ID_MERGE_FULL) {
+            zi_paint_button(app, hdc, ctrl);
+        } else if (ctrl->id == ZI_ID_NONE && ctrl->extra == 2 && ctrl->label) {
             zi_text(hdc, app->font, ZI_INK, ctrl->rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, ctrl->label);
         } else if (ctrl->id == ZI_ID_NONE && ctrl->label && wcscmp(ctrl->label, L"Source") == 0) {
             zi_text(hdc, app->font, ZI_INK, ctrl->rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE, ctrl->label);

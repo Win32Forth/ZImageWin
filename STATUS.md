@@ -2,6 +2,14 @@
 
 Newest first. The Mac log is `C:\VSCodeProjects\ZImage\STATUS.md`.
 
+## 2026-11-23 — ZImager 1.8.6.1
+
+- Status: done
+- Scope: Windows file version, product version, and manifest are 1.8.6.1. The folder column matches the Mac stack. Tone order is Auto, Reset, Flatten. Help, About ZImager reads the running program. `.zimg` `appVersion` stays `1.0.0`. The schema stays 1.
+- Notes: `build.bat` wrote `build\arm64\ZImager.exe`. `build-x64.bat` wrote `build\x64\ZImager.exe`. Both file versions and product versions read 1.8.6.1. `build-test.bat` and `build-test-x64.bat` printed `ok`. `Install\build-installers.bat` wrote `dist\ZImager-1.8.6.1-arm64.exe` (2360016 bytes, SHA-256 `f023b21bc0f1b4c7a4508196c544a2cbadfe04fe9cf7989d1f8b48abbf2dd169`) and `dist\ZImager-1.8.6.1-x64.exe` (2423252 bytes, SHA-256 `d438a8156570072a4f751e26ed6d2cb3d354b510845469e30600ba81efc914eb`). The 1.0.0 and 1.8.6 installers stay in `dist`. The window was not launched for this stamp. No helper route that changes the library was sent. The NAS binary was left where it is.
+
+The Folder column scrolls on its own. A Photos folder with more than one page opens with the page panel, then Preview, Date, Move, Merge, and Build previews. Review keeps Preview, Date, and Set date. The disclosure is at the right of the title, with a short space before the first letter. Open points down. Collapsed points up. Find, Clear filter, Rescan, and Delete ALL sit on the center header. A merge preview replaces the grid. Fit and 100% sit on the black join. Server Move, Organize, Clean, Rescan, and Rename still say the action is left for a confirmed run. Delete ALL was not pressed.
+
 ## 2026-11-23 — ZImager 1.8.6
 
 - Status: done
