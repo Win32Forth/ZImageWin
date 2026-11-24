@@ -10,27 +10,36 @@
 #define ZI_PI 3.14159265358979323846
 
 static const ZiSliderSpec k_sliders[ZI_SLIDER_COUNT] = {
-    { L"Shadows", 0, 0, 1, 1, 0, 0 },
-    { L"Midtones", 0, 0, 1, 1, 0.5, 0 },
-    { L"Highlights", 0, 0, 1, 1, 1, 0 },
-    { L"Exposure", 1, -5, 5, 1, 0, 1 },
-    { L"Brightness", 1, -1, 1, 1, 0, 0 },
-    { L"Contrast", 1, -1, 1, 1, 0, 0 },
-    { L"Highlights", 1, -1, 1, 1, 0, 0 },
-    { L"Shadows", 1, -1, 1, 1, 0, 0 },
-    { L"Whites", 1, -1, 1, 1, 0, 0 },
-    { L"Blacks", 1, -1, 1, 1, 0, 0 },
-    { L"Texture", 1, -1, 1, 1, 0, 0 },
-    { L"Clarity", 1, -1, 1, 1, 0, 0 },
-    { L"Dehaze", 1, 0, 1, 0, 0, 0 },
-    { L"Vibrance", 1, -1, 1, 1, 0, 0 },
-    { L"Saturation", 1, -1, 1, 1, 0, 0 },
-    { L"Temperature", 2, 2000, 50000, 0, 6500, 2 },
-    { L"Tint", 2, -150, 150, 1, 0, 3 },
-    { L"Straighten", 3, -45, 45, 1, 0, 4 },
-    { L"Vertical", 3, -1, 1, 1, 0, 0 },
-    { L"Horizontal", 3, -1, 1, 1, 0, 0 },
-    { L"Sharpness", 3, -1, 1, 1, 0, 0 },
+    { L"Shadows", ZI_SEC_SPECTRUM, 0, 1, 1, 0, 0 },
+    { L"Midtones", ZI_SEC_SPECTRUM, 0, 1, 1, 0.5, 0 },
+    { L"Highlights", ZI_SEC_SPECTRUM, 0, 1, 1, 1, 0 },
+    { L"Exposure", ZI_SEC_TONE, -5, 5, 1, 0, 1 },
+    { L"Brightness", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Contrast", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Highlights", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Shadows", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Whites", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Blacks", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Dehaze", ZI_SEC_TONE, 0, 1, 0, 0, 0 },
+    { L"Vibrance", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Saturation", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Texture", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Clarity", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Details", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Sharpness", ZI_SEC_TONE, -1, 1, 1, 0, 0 },
+    { L"Temperature", ZI_SEC_COLOR, 2000, 50000, 0, 6500, 2 },
+    { L"Tint", ZI_SEC_COLOR, -150, 150, 1, 0, 3 },
+    { L"Straighten", ZI_SEC_GEOMETRY, -45, 45, 1, 0, 4 },
+    { L"Vertical", ZI_SEC_GEOMETRY, -1, 1, 1, 0, 0 },
+    { L"Horizontal", ZI_SEC_GEOMETRY, -1, 1, 1, 0, 0 },
+    { L"X offset", ZI_SEC_GEOMETRY, -1, 1, 1, 0, 0 },
+    { L"Y offset", ZI_SEC_GEOMETRY, -1, 1, 1, 0, 0 },
+    { L"Amount", ZI_SEC_VIGNETTE, -1, 1, 1, 0, 0 },
+    { L"Midpoint", ZI_SEC_VIGNETTE, 0, 1, 1, 0.5, 5 },
+    { L"Roundness", ZI_SEC_VIGNETTE, -1, 1, 1, 0, 0 },
+    { L"Feather", ZI_SEC_VIGNETTE, 0, 1, 1, 0.5, 5 },
+    { L"X", ZI_SEC_VIGNETTE, -1, 1, 1, 0, 0 },
+    { L"Y", ZI_SEC_VIGNETTE, -1, 1, 1, 0, 0 },
     { L"k1", -1, -0.50, 0.20, 0, 0, 0 },
     { L"k2", -1, -0.20, 0.20, 0, 0, 0 },
     { L"Top left X", -1, -0.5, 1.5, 1, 0.5, 5 },
@@ -48,6 +57,9 @@ void zi_tone_identity(ZiTone *tone) {
     tone->temperature = 6500;
     tone->spectrum_mid = 0.5;
     tone->spectrum_high = 1;
+    zi_curves_identity(&tone->curves);
+    tone->vignette_mid = 0.5;
+    tone->vignette_feather = 0.5;
 }
 
 static int zi_near(double a, double b) {
@@ -86,6 +98,7 @@ int zi_tone_same(const ZiTone *a, const ZiTone *b) {
            zi_near(a->blacks, b->blacks) &&
            zi_near(a->texture, b->texture) &&
            zi_near(a->clarity, b->clarity) &&
+           zi_near(a->details, b->details) &&
            zi_near(a->dehaze, b->dehaze) &&
            zi_near(a->vibrance, b->vibrance) &&
            zi_near(a->saturation, b->saturation) &&
@@ -97,6 +110,8 @@ int zi_tone_same(const ZiTone *a, const ZiTone *b) {
            zi_near(a->straighten, b->straighten) &&
            zi_near(a->vertical, b->vertical) &&
            zi_near(a->horizontal, b->horizontal) &&
+           zi_near(a->offset_x, b->offset_x) &&
+           zi_near(a->offset_y, b->offset_y) &&
            zi_near(a->sharpness, b->sharpness) &&
            zi_near(a->k1, b->k1) &&
            zi_near(a->k2, b->k2) &&
@@ -104,6 +119,8 @@ int zi_tone_same(const ZiTone *a, const ZiTone *b) {
            a->lens == b->lens &&
            zi_corners_same(a, b) &&
            (a->turns & 3) == (b->turns & 3) &&
+           a->flip_h == b->flip_h &&
+           a->flip_v == b->flip_v &&
            a->has_crop == b->has_crop &&
            (!a->has_crop || (zi_near(a->crop_x, b->crop_x) &&
                              zi_near(a->crop_y, b->crop_y) &&
@@ -112,7 +129,14 @@ int zi_tone_same(const ZiTone *a, const ZiTone *b) {
            a->has_skin == b->has_skin &&
            (!a->has_skin || (a->skin_preset == b->skin_preset &&
                              zi_near(a->skin_delta_a, b->skin_delta_a) &&
-                             zi_near(a->skin_delta_b, b->skin_delta_b)));
+                             zi_near(a->skin_delta_b, b->skin_delta_b))) &&
+           zi_near(a->vignette_amount, b->vignette_amount) &&
+           zi_near(a->vignette_mid, b->vignette_mid) &&
+           zi_near(a->vignette_round, b->vignette_round) &&
+           zi_near(a->vignette_feather, b->vignette_feather) &&
+           zi_near(a->vignette_x, b->vignette_x) &&
+           zi_near(a->vignette_y, b->vignette_y) &&
+           zi_curves_same(&a->curves, &b->curves);
 }
 
 static int zi_crop_active(const ZiTone *tone) {
@@ -244,11 +268,15 @@ int zi_tone_needs_pipeline(const ZiTone *tone) {
     if (zi_active(tone->exposure) || zi_active(tone->brightness) || zi_active(tone->contrast) ||
         zi_active(tone->highlights) || zi_active(tone->shadows) || zi_active(tone->whites) ||
         zi_active(tone->blacks) || zi_active(tone->texture) || zi_active(tone->clarity) ||
+        zi_active(tone->details) ||
         tone->dehaze > 0.0000001 || zi_active(tone->vibrance) || zi_active(tone->saturation) ||
         !zi_near(tone->temperature, 6500) || zi_active(tone->tint) ||
         tone->spectrum_low > 0.0005 || tone->spectrum_high < 0.9995 ||
-        !zi_near(tone->spectrum_mid, 0.5) || zi_active(tone->straighten) ||
+        !zi_near(tone->spectrum_mid, 0.5) || !zi_curves_linear(&tone->curves) ||
+        zi_active(tone->straighten) ||
         zi_active(tone->vertical) || zi_active(tone->horizontal) || zi_active(tone->sharpness) ||
+        zi_active(tone->offset_x) || zi_active(tone->offset_y) ||
+        tone->flip_h || tone->flip_v || zi_active(tone->vignette_amount) ||
         zi_lens_active(tone) || zi_corners_warp(tone) ||
         zi_crop_active(tone) ||
         (tone->has_skin && (zi_active(tone->skin_delta_a) || zi_active(tone->skin_delta_b)))) {
@@ -286,17 +314,26 @@ double zi_slider_get(const ZiTone *tone, int index) {
     case ZI_SL_SHADOWS: return tone->shadows;
     case ZI_SL_WHITES: return tone->whites;
     case ZI_SL_BLACKS: return tone->blacks;
-    case ZI_SL_TEXTURE: return tone->texture;
-    case ZI_SL_CLARITY: return tone->clarity;
     case ZI_SL_DEHAZE: return tone->dehaze;
     case ZI_SL_VIBRANCE: return tone->vibrance;
     case ZI_SL_SATURATION: return tone->saturation;
+    case ZI_SL_TEXTURE: return tone->texture;
+    case ZI_SL_CLARITY: return tone->clarity;
+    case ZI_SL_DETAILS: return tone->details;
+    case ZI_SL_SHARPNESS: return tone->sharpness;
     case ZI_SL_TEMPERATURE: return tone->temperature;
     case ZI_SL_TINT: return tone->tint;
     case ZI_SL_STRAIGHTEN: return tone->straighten;
     case ZI_SL_VERTICAL: return tone->vertical;
     case ZI_SL_HORIZONTAL: return tone->horizontal;
-    case ZI_SL_SHARPNESS: return tone->sharpness;
+    case ZI_SL_OFFSET_X: return tone->offset_x;
+    case ZI_SL_OFFSET_Y: return tone->offset_y;
+    case ZI_SL_VIG_AMOUNT: return tone->vignette_amount;
+    case ZI_SL_VIG_MID: return tone->vignette_mid;
+    case ZI_SL_VIG_ROUND: return tone->vignette_round;
+    case ZI_SL_VIG_FEATHER: return tone->vignette_feather;
+    case ZI_SL_VIG_X: return tone->vignette_x;
+    case ZI_SL_VIG_Y: return tone->vignette_y;
     case ZI_SL_K1: return tone->k1;
     case ZI_SL_K2: return tone->k2;
     case ZI_SL_CTL_X: return tone->corner_x[0];
@@ -333,17 +370,26 @@ void zi_slider_set(ZiTone *tone, int index, double value) {
     case ZI_SL_SHADOWS: tone->shadows = value; break;
     case ZI_SL_WHITES: tone->whites = value; break;
     case ZI_SL_BLACKS: tone->blacks = value; break;
-    case ZI_SL_TEXTURE: tone->texture = value; break;
-    case ZI_SL_CLARITY: tone->clarity = value; break;
     case ZI_SL_DEHAZE: tone->dehaze = value; break;
     case ZI_SL_VIBRANCE: tone->vibrance = value; break;
     case ZI_SL_SATURATION: tone->saturation = value; break;
+    case ZI_SL_TEXTURE: tone->texture = value; break;
+    case ZI_SL_CLARITY: tone->clarity = value; break;
+    case ZI_SL_DETAILS: tone->details = value; break;
+    case ZI_SL_SHARPNESS: tone->sharpness = value; break;
     case ZI_SL_TEMPERATURE: tone->temperature = value; break;
     case ZI_SL_TINT: tone->tint = value; break;
     case ZI_SL_STRAIGHTEN: tone->straighten = value; break;
     case ZI_SL_VERTICAL: tone->vertical = value; break;
     case ZI_SL_HORIZONTAL: tone->horizontal = value; break;
-    case ZI_SL_SHARPNESS: tone->sharpness = value; break;
+    case ZI_SL_OFFSET_X: tone->offset_x = value; break;
+    case ZI_SL_OFFSET_Y: tone->offset_y = value; break;
+    case ZI_SL_VIG_AMOUNT: tone->vignette_amount = value; break;
+    case ZI_SL_VIG_MID: tone->vignette_mid = value; break;
+    case ZI_SL_VIG_ROUND: tone->vignette_round = value; break;
+    case ZI_SL_VIG_FEATHER: tone->vignette_feather = value; break;
+    case ZI_SL_VIG_X: tone->vignette_x = value; break;
+    case ZI_SL_VIG_Y: tone->vignette_y = value; break;
     case ZI_SL_K1: tone->k1 = value; break;
     case ZI_SL_K2: tone->k2 = value; break;
     case ZI_SL_CTL_X: tone->corner_x[0] = value; break;
@@ -544,55 +590,65 @@ void zi_lens_copy(ZiTone *tone, int index) {
     tone->fov = k_lenses[index].fov;
 }
 
-void zi_horizon_delta(double x0, double y0, double x1, double y1, int *quarter_turns, double *degrees) {
-    double dx = x1 - x0;
-    double dy = y1 - y0;
-    double tilt;
-    double needed;
-    int turns = 0;
+void zi_horizon_delta(double x0, double y0, double x1, double y1,
+                      double pixel_width, double pixel_height,
+                      int *quarter_turns, double *degrees) {
+    zi_horizon_measure(x0, y0, x1, y1, pixel_width, pixel_height, quarter_turns, degrees);
+}
 
-    if (quarter_turns) {
-        *quarter_turns = 0;
-    }
-    if (degrees) {
-        *degrees = 0;
-    }
-    if (dx == 0 && dy == 0) {
+void zi_tone_apply_turn(ZiTone *tone, int delta) {
+    int wrapped = zi_wrap_turns(delta);
+    ZiNormRect rect;
+
+    if (wrapped == 0) {
         return;
     }
-    tilt = atan2(dy, dx) * 180.0 / ZI_PI;
-    while (tilt > 90.0) {
-        tilt -= 180.0;
+    tone->turns = zi_wrap_turns(tone->turns + wrapped);
+    zi_flip_swap_if_odd(&tone->flip_h, &tone->flip_v, wrapped);
+    if (!tone->has_crop) {
+        return;
     }
-    while (tilt <= -90.0) {
-        tilt += 180.0;
+    rect.x = tone->crop_x;
+    rect.y = tone->crop_y;
+    rect.w = tone->crop_w;
+    rect.h = tone->crop_h;
+    zi_crop_rotate(&rect, wrapped);
+    tone->crop_x = rect.x;
+    tone->crop_y = rect.y;
+    tone->crop_w = rect.w;
+    tone->crop_h = rect.h;
+}
+
+void zi_tone_apply_flip(ZiTone *tone, int horizontal) {
+    ZiNormRect rect;
+
+    if (horizontal) {
+        tone->flip_h = !tone->flip_h;
+    } else {
+        tone->flip_v = !tone->flip_v;
     }
-    needed = tilt;
-    if (needed > 45.0) {
-        turns = 1;
-        needed -= 90.0;
-    } else if (needed < -45.0) {
-        turns = -1;
-        needed += 90.0;
+    if (!tone->has_crop) {
+        return;
     }
-    if (needed > 45.0) {
-        needed = 45.0;
+    rect.x = tone->crop_x;
+    rect.y = tone->crop_y;
+    rect.w = tone->crop_w;
+    rect.h = tone->crop_h;
+    if (horizontal) {
+        zi_crop_mirror_h(&rect);
+    } else {
+        zi_crop_mirror_v(&rect);
     }
-    if (needed < -45.0) {
-        needed = -45.0;
-    }
-    if (quarter_turns) {
-        *quarter_turns = turns;
-    }
-    if (degrees) {
-        *degrees = needed;
-    }
+    tone->crop_x = rect.x;
+    tone->crop_y = rect.y;
+    tone->crop_w = rect.w;
+    tone->crop_h = rect.h;
 }
 
 int zi_geometry_body_dip(const ZiApp *app) {
     int height = ZI_GEO_TOP + ZI_GEO_ROW + ZI_GEO_GAP + ZI_GEO_HINT;
 
-    height += 4 * ZI_GEO_ROW;
+    height += 5 * ZI_GEO_ROW;
     height += ZI_GEO_GAP + ZI_GEO_ROW;
     if (app && app->edit.has_corners) {
         height += 4 * (ZI_GEO_TITLE + 2 * ZI_GEO_ROW);
@@ -602,26 +658,34 @@ int zi_geometry_body_dip(const ZiApp *app) {
     return height;
 }
 
+int zi_curve_body_dip(const ZiApp *app) {
+    (void)app;
+    return 228;
+}
+
 int zi_section_body_dip(const ZiApp *app, int section) {
     int count = 0;
     int i;
 
-    if (section == 0) {
+    if (section == ZI_SEC_SPECTRUM) {
         return 112;
     }
-    if (section == 2) {
+    if (section == ZI_SEC_CURVE) {
+        return zi_curve_body_dip(app);
+    }
+    if (section == ZI_SEC_COLOR) {
         return zi_color_body_dip(app);
     }
-    if (section == 3) {
+    if (section == ZI_SEC_GEOMETRY) {
         return zi_geometry_body_dip(app);
     }
-    if (section == 4) {
+    if (section == ZI_SEC_TOUCHUP) {
         if (app && app->touch_body_dip > 0) {
             return app->touch_body_dip;
         }
         return 184;
     }
-    if (section == 5) {
+    if (section == ZI_SEC_HISTORY) {
         if (app->hist_len < 1) {
             return 36;
         }
@@ -631,6 +695,10 @@ int zi_section_body_dip(const ZiApp *app, int section) {
         if (k_sliders[i].section == section) {
             count++;
         }
+    }
+    if (section == ZI_SEC_TONE) {
+        /* The extra 8 is the hairline under Saturation, before Texture. */
+        return 8 + count * 28 + 8 + 8;
     }
     return 8 + count * 28;
 }
@@ -820,6 +888,52 @@ static float *zi_turn(const float *src, int w, int h, int quarters, int *out_w, 
     }
     *out_w = dw;
     *out_h = dh;
+    return dst;
+}
+
+static float *zi_flip(const float *src, int w, int h, int flip_h, int flip_v) {
+    float *dst;
+    int x;
+    int y;
+
+    dst = (float *)malloc((size_t)w * (size_t)h * 3 * sizeof(float));
+    if (!dst) {
+        return NULL;
+    }
+    for (y = 0; y < h; y++) {
+        int sy = flip_v ? h - 1 - y : y;
+
+        for (x = 0; x < w; x++) {
+            int sx = flip_h ? w - 1 - x : x;
+            const float *sp = src + ((size_t)sy * (size_t)w + (size_t)sx) * 3;
+            float *dp = dst + ((size_t)y * (size_t)w + (size_t)x) * 3;
+
+            dp[0] = sp[0];
+            dp[1] = sp[1];
+            dp[2] = sp[2];
+        }
+    }
+    return dst;
+}
+
+static float *zi_offset(const float *src, int w, int h, double offset_x, double offset_y) {
+    float *dst;
+    int x;
+    int y;
+    double shift_x = offset_x * (double)w;
+    double shift_y = offset_y * (double)h;
+
+    dst = (float *)malloc((size_t)w * (size_t)h * 3 * sizeof(float));
+    if (!dst) {
+        return NULL;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            float *out = dst + ((size_t)y * (size_t)w + (size_t)x) * 3;
+
+            zi_sample(src, w, h, (double)x - shift_x, (double)y + shift_y, &out[0], &out[1], &out[2]);
+        }
+    }
     return dst;
 }
 
@@ -1655,6 +1769,7 @@ static void zi_grade_pixels(float *pix, float *tmp, float *scratch, int w, int h
     int use_sat = zi_active(tone->saturation);
     int use_temp = !zi_near(tone->temperature, 6500) || zi_active(tone->tint);
     int use_spectrum = tone->spectrum_low > 0.0005 || tone->spectrum_high < 0.9995 || !zi_near(tone->spectrum_mid, 0.5);
+    int use_curves = !zi_curves_linear(&tone->curves);
 
     if (use_temp) {
         zi_temp_gains(tone->temperature, tone->tint, &gain_r, &gain_g, &gain_b);
@@ -1760,11 +1875,15 @@ static void zi_grade_pixels(float *pix, float *tmp, float *scratch, int w, int h
             g = zi_srgb_to_linear(g);
             b = zi_srgb_to_linear(b);
         }
+        if (use_curves) {
+            zi_curve_map_linear(&tone->curves, &r, &g, &b);
+        }
         pix[i * 3] = (float)r;
         pix[i * 3 + 1] = (float)g;
         pix[i * 3 + 2] = (float)b;
     }
     zi_detail(pix, tmp, scratch, w, h, tone->texture, 1.5 * long_edge / 2560.0);
+    zi_detail(pix, tmp, scratch, w, h, tone->details, 8.0 * long_edge / 2560.0);
     zi_detail(pix, tmp, scratch, w, h, tone->clarity, 30.0 * long_edge / 2560.0);
     if (tone->dehaze > 0.0000001) {
         int rad = (int)(32.0 * long_edge / 2560.0 + 0.5);
@@ -1789,6 +1908,18 @@ static void zi_grade_pixels(float *pix, float *tmp, float *scratch, int w, int h
     }
     if (tone->has_skin && (zi_active(tone->skin_delta_a) || zi_active(tone->skin_delta_b))) {
         zi_apply_skin(pix, count, tone->skin_delta_a, tone->skin_delta_b);
+    }
+    if (zi_active(tone->vignette_amount)) {
+        for (i = 0; i < count; i++) {
+            int x = (int)(i % (size_t)w);
+            int y = (int)(i / (size_t)w);
+            double coverage = zi_vignette_coverage_px(x, y, w, h, tone->vignette_mid, tone->vignette_round,
+                                                      tone->vignette_feather, tone->vignette_x, tone->vignette_y);
+
+            pix[i * 3] = (float)zi_vignette_shade(pix[i * 3], tone->vignette_amount, coverage);
+            pix[i * 3 + 1] = (float)zi_vignette_shade(pix[i * 3 + 1], tone->vignette_amount, coverage);
+            pix[i * 3 + 2] = (float)zi_vignette_shade(pix[i * 3 + 2], tone->vignette_amount, coverage);
+        }
     }
 }
 
@@ -2052,29 +2183,19 @@ static HBITMAP zi_tone_render_ex(HBITMAP base, const ZiTone *tone, const ZiTouch
         free(pix);
         pix = replaced;
     }
-    if (tone->has_corners) {
-        if (zi_corners_warp(tone)) {
-            int dw = w;
-            int dh = h;
+    if (tone->has_corners && zi_corners_warp(tone)) {
+        int dw = w;
+        int dh = h;
 
-            replaced = zi_perspective(pix, w, h, tone, &dw, &dh);
-            if (!replaced) {
-                free(pix);
-                return NULL;
-            }
-            free(pix);
-            pix = replaced;
-            w = dw;
-            h = dh;
-        }
-    } else if (zi_active(tone->vertical) || zi_active(tone->horizontal)) {
-        replaced = zi_keystone(pix, w, h, tone->vertical, tone->horizontal);
+        replaced = zi_perspective(pix, w, h, tone, &dw, &dh);
         if (!replaced) {
             free(pix);
             return NULL;
         }
         free(pix);
         pix = replaced;
+        w = dw;
+        h = dh;
     }
     if ((tone->turns & 3) != 0) {
         int dw = w;
@@ -2089,6 +2210,24 @@ static HBITMAP zi_tone_render_ex(HBITMAP base, const ZiTone *tone, const ZiTouch
         w = dw;
         h = dh;
     }
+    if (tone->flip_h || tone->flip_v) {
+        replaced = zi_flip(pix, w, h, tone->flip_h, tone->flip_v);
+        if (!replaced) {
+            free(pix);
+            return NULL;
+        }
+        free(pix);
+        pix = replaced;
+    }
+    if (!tone->has_corners && (zi_active(tone->vertical) || zi_active(tone->horizontal))) {
+        replaced = zi_keystone(pix, w, h, tone->vertical, tone->horizontal);
+        if (!replaced) {
+            free(pix);
+            return NULL;
+        }
+        free(pix);
+        pix = replaced;
+    }
     if (zi_active(tone->straighten)) {
         int dw = w;
         int dh = h;
@@ -2101,6 +2240,15 @@ static HBITMAP zi_tone_render_ex(HBITMAP base, const ZiTone *tone, const ZiTouch
         pix = replaced;
         w = dw;
         h = dh;
+    }
+    if (zi_active(tone->offset_x) || zi_active(tone->offset_y)) {
+        replaced = zi_offset(pix, w, h, tone->offset_x, tone->offset_y);
+        if (!replaced) {
+            free(pix);
+            return NULL;
+        }
+        free(pix);
+        pix = replaced;
     }
     count = (size_t)w * (size_t)h;
     tmp = (float *)malloc(count * 3 * sizeof(float));
@@ -2147,7 +2295,7 @@ static HBITMAP zi_tone_render_ex(HBITMAP base, const ZiTone *tone, const ZiTouch
         }
     }
     if (touch) {
-        zi_touch_apply(pix, w, h, touch);
+        zi_touch_apply(pix, w, h, touch, tone->turns & 3, tone->flip_h, tone->flip_v);
     }
     if (stage) {
         *stage = pix;
@@ -2194,6 +2342,10 @@ float *zi_tone_stage_rgb(HBITMAP base, const ZiTone *tone, const ZiTouchDoc *tou
 /* Geometry is already in the base bitmap, so Auto can count those bytes. */
 static int zi_auto_base_ready(const ZiTone *tone) {
     return (tone->turns & 3) == 0 &&
+           !tone->flip_h &&
+           !tone->flip_v &&
+           !zi_active(tone->offset_x) &&
+           !zi_active(tone->offset_y) &&
            !zi_active(tone->straighten) &&
            !zi_active(tone->vertical) &&
            !zi_active(tone->horizontal) &&
@@ -2205,26 +2357,11 @@ static int zi_auto_base_ready(const ZiTone *tone) {
 
 static void zi_auto_clear_grade(ZiTone *tone) {
     tone->exposure = 0;
-    tone->brightness = 0;
     tone->contrast = 0;
     tone->highlights = 0;
     tone->shadows = 0;
     tone->whites = 0;
     tone->blacks = 0;
-    tone->texture = 0;
-    tone->clarity = 0;
-    tone->dehaze = 0;
-    tone->vibrance = 0;
-    tone->saturation = 0;
-    tone->temperature = 6500;
-    tone->tint = 0;
-    tone->spectrum_low = 0;
-    tone->spectrum_mid = 0.5;
-    tone->spectrum_high = 1;
-    tone->has_skin = 0;
-    tone->skin_preset = 0;
-    tone->skin_delta_a = 0;
-    tone->skin_delta_b = 0;
 }
 
 static int zi_auto_histogram(HBITMAP dib, int histogram[256]) {
@@ -2286,81 +2423,22 @@ static double zi_auto_percentile(double p, const int histogram[256], int total) 
     return 1;
 }
 
-static double zi_auto_linear(double encoded) {
-    double c = encoded;
-
-    if (c < 0) {
-        c = 0;
-    }
-    if (c > 1) {
-        c = 1;
-    }
-    if (c <= 0.04045) {
-        return c / 12.92;
-    }
-    return pow((c + 0.055) / 1.055, 2.4);
-}
-
 static void zi_auto_apply(ZiTone *tone, const int histogram[256], int total) {
-    double black = zi_auto_percentile(0.005, histogram, total);
-    double shadow = zi_auto_percentile(0.15, histogram, total);
-    double mid = zi_auto_percentile(0.50, histogram, total);
-    double white = zi_auto_percentile(0.995, histogram, total);
-    double span = white - black;
-    double exposure;
-    double contrast;
-    double highlights;
-    double shadows;
-    double whites;
-    double blacks;
-    double current;
+    ZiAutoLevels levels;
+    ZiAutoGrade grade;
 
-    current = zi_auto_linear(mid);
-    if (current < 0.002) {
-        current = 0.002;
-    }
-    exposure = log2(zi_auto_linear(0.45) / current);
-    if (span < 0.55) {
-        contrast = (0.75 - span) * 0.8;
-        if (contrast > 0.45) {
-            contrast = 0.45;
-        }
-    } else if (span > 0.92) {
-        contrast = (0.92 - span) * 1.5;
-        if (contrast < -0.35) {
-            contrast = -0.35;
-        }
-    } else {
-        contrast = 0;
-    }
-    highlights = 0;
-    if (white >= 0.985) {
-        highlights = -(white - 0.96) * 10;
-    }
-    shadows = 0;
-    if (shadow < 0.16 && black < 0.04) {
-        shadows = (0.18 - shadow) * 2;
-    }
-    if (white < 0.90) {
-        whites = (0.97 - white) * 2;
-    } else if (white >= 0.995) {
-        whites = -0.15;
-    } else {
-        whites = 0;
-    }
-    if (black > 0.06 && white > black + 0.4) {
-        blacks = -(black - 0.02) * 4;
-    } else if (black < 0.005 && shadow < 0.06) {
-        blacks = 0.12;
-    } else {
-        blacks = 0;
-    }
-    tone->exposure = zi_clamp(exposure, -1.5, 1.5);
-    tone->contrast = zi_clamp(contrast, -0.45, 0.5);
-    tone->highlights = zi_clamp(highlights, -0.8, 0);
-    tone->shadows = zi_clamp(shadows, 0, 0.55);
-    tone->whites = zi_clamp(whites, -0.2, 0.7);
-    tone->blacks = zi_clamp(blacks, -0.75, 0.15);
+    levels.black = zi_auto_percentile(0.005, histogram, total);
+    levels.shadow = zi_auto_percentile(0.15, histogram, total);
+    levels.mid = zi_auto_percentile(0.50, histogram, total);
+    levels.highlight = zi_auto_percentile(0.85, histogram, total);
+    levels.white = zi_auto_percentile(0.995, histogram, total);
+    zi_auto_from_levels(&levels, &grade);
+    tone->exposure = grade.exposure;
+    tone->contrast = grade.contrast;
+    tone->highlights = grade.highlights;
+    tone->shadows = grade.shadows;
+    tone->whites = grade.whites;
+    tone->blacks = grade.blacks;
 }
 
 int zi_tone_auto(HBITMAP base, ZiTone *tone, const ZiTouchDoc *touch) {

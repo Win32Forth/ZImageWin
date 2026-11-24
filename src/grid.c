@@ -1,8 +1,10 @@
-/* Folder grid. Names come from the selected directory. Thumbnails are decoded off the UI thread. */
+/* Folder grid. The catalog keeps light names. Thumbnails decode for the page on screen. */
 #include "grid.h"
 #include "editor.h"
+#include "blake3.h"
 
 #include <wincodec.h>
+#include <oleauto.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +17,7 @@ static WNDPROC g_vscroll_proc;
 
 static const wchar_t *const k_stills[] = {
     L"jpg", L"jpeg", L"png", L"tif", L"tiff", L"heic", L"heif", L"webp", L"gif", L"bmp",
-    L"dng", L"raf", L"arw", L"cr2", L"nef", L"orf", L"rw2", L"raw"
+    L"dng", L"raf", L"arw", L"cr2", L"nef", L"orf", L"rw2", L"raw", L"x3f", L"pdf"
 };
 
 static const wchar_t *const k_videos[] = {
@@ -38,13 +40,45 @@ static int zi_has_ext(const wchar_t *name, const wchar_t *const *exts, int count
     return 0;
 }
 
-static int zi_file_less(const void *a, const void *b) {
+/* Name, path, and video flag. No thumbnail lives in the catalog. */
+typedef struct ZiCatItem {
+    wchar_t name[ZI_NAME];
+    wchar_t path[MAX_PATH];
+    int video;
+} ZiCatItem;
+
+typedef struct ZiCatPack {
+    int still_count;
+    int video_count;
+    ZiCatItem items[1];
+} ZiCatPack;
+
+static ZiCatPack *g_pack;
+static ZiCatItem *g_stills;
+static ZiCatItem *g_videos;
+static int g_still_count;
+static int g_video_count;
+static int g_catalog_capped;
+static int g_have_catalog;
+
+static int zi_file_name_less(const void *a, const void *b) {
     const ZiFile *fa = (const ZiFile *)a;
     const ZiFile *fb = (const ZiFile *)b;
 
-    if (fa->video != fb->video) {
-        return fa->video - fb->video;
-    }
+    return _wcsicmp(fa->name, fb->name);
+}
+
+static int zi_cat_name_less(const void *a, const void *b) {
+    const ZiCatItem *fa = (const ZiCatItem *)a;
+    const ZiCatItem *fb = (const ZiCatItem *)b;
+
+    return _wcsicmp(fa->name, fb->name);
+}
+
+static int zi_cat_ptr_less(const void *a, const void *b) {
+    const ZiCatItem *fa = *(const ZiCatItem *const *)a;
+    const ZiCatItem *fb = *(const ZiCatItem *const *)b;
+
     return _wcsicmp(fa->name, fb->name);
 }
 
@@ -228,29 +262,33 @@ typedef struct ZiGridJob {
     HWND hwnd;
     LONG generation;
     int count;
+    volatile LONG next;
+    volatile LONG workers;
     wchar_t path[ZI_MAX_FILES][MAX_PATH];
 } ZiGridJob;
 
 static DWORD WINAPI zi_grid_thread(LPVOID param) {
     ZiGridJob *job = (ZiGridJob *)param;
     IWICImagingFactory *factory = NULL;
-    int i;
 
     if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) {
-        free(job);
+        if (InterlockedDecrement(&job->workers) == 0) {
+            free(job);
+        }
         return 0;
     }
     CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&factory);
-    for (i = 0; factory && i < job->count; i++) {
+    for (;;) {
+        int i = (int)InterlockedIncrement(&job->next) - 1;
         ZiThumbNote *note;
         HBITMAP bitmap = NULL;
         int w = 0;
         int h = 0;
 
-        if (!g_grid_alive || job->generation != g_grid_generation) {
+        if (i >= job->count || !g_grid_alive || job->generation != g_grid_generation) {
             break;
         }
-        if (!job->path[i][0]) {
+        if (!factory || !job->path[i][0]) {
             continue;
         }
         bitmap = zi_decode_thumb(factory, job->path[i], &w, &h);
@@ -284,7 +322,9 @@ static DWORD WINAPI zi_grid_thread(LPVOID param) {
         factory->lpVtbl->Release(factory);
     }
     CoUninitialize();
-    free(job);
+    if (InterlockedDecrement(&job->workers) == 0) {
+        free(job);
+    }
     return 0;
 }
 
@@ -292,44 +332,103 @@ typedef struct ZiListBuild {
     LONG generation;
     int nested;
     int capped;
-    int count;
+    int oom;
     wchar_t root[MAX_PATH];
-    ZiFile *files;
+    ZiCatItem *stills;
+    int still_count;
+    int still_cap;
+    ZiCatItem *videos;
+    int video_count;
+    int video_cap;
 } ZiListBuild;
 
+static int zi_cat_reserve(ZiCatItem **items, int *cap, int count) {
+    int next;
+    ZiCatItem *grown;
+
+    if (count < *cap) {
+        return 1;
+    }
+    next = *cap > 0 ? *cap * 2 : 256;
+    if (next <= count) {
+        next = count + 1;
+    }
+    if (next > ZI_CATALOG_CAP) {
+        next = ZI_CATALOG_CAP;
+    }
+    if (count >= next) {
+        return 0;
+    }
+    grown = (ZiCatItem *)realloc(*items, (size_t)next * sizeof *grown);
+    if (!grown) {
+        return 0;
+    }
+    *items = grown;
+    *cap = next;
+    return 1;
+}
+
 static int zi_grid_add(ZiListBuild *build, const wchar_t *dir, const wchar_t *name, int video) {
-    ZiFile *file;
+    ZiCatItem *slot;
     wchar_t relative[ZI_NAME];
     size_t root_len;
 
-    if (build->count >= ZI_MAX_FILES) {
+    if (build->still_count + build->video_count >= ZI_CATALOG_CAP) {
         build->capped = 1;
         return 1;
     }
+    /* C:\ keeps its slash. That slash is the separator, not part of the prefix. */
     root_len = wcslen(build->root);
-    if (_wcsnicmp(dir, build->root, root_len) == 0 && (dir[root_len] == L'\\' || dir[root_len] == L'\0')) {
-        if (dir[root_len] == L'\0') {
-            wcscpy_s(relative, ZI_NAME, name);
-        } else if (swprintf_s(relative, ZI_NAME, L"%s\\%s", dir + root_len + 1, name) < 0) {
+    if (root_len > 0 && (build->root[root_len - 1] == L'\\' || build->root[root_len - 1] == L'/')) {
+        root_len--;
+    }
+    if (root_len > 0 &&
+        _wcsnicmp(dir, build->root, root_len) == 0 &&
+        (dir[root_len] == L'\\' || dir[root_len] == L'/' || dir[root_len] == L'\0')) {
+        const wchar_t *rest = dir + root_len;
+
+        if (*rest == L'\\' || *rest == L'/') {
+            rest++;
+        }
+        if (rest[0] == L'\0') {
+            if (wcscpy_s(relative, ZI_NAME, name) != 0) {
+                return 0;
+            }
+        } else if (swprintf_s(relative, ZI_NAME, L"%s\\%s", rest, name) < 0) {
             return 0;
         }
-    } else {
-        wcscpy_s(relative, ZI_NAME, name);
+    } else if (wcscpy_s(relative, ZI_NAME, name) != 0) {
+        return 0;
     }
     if (wcslen(dir) + wcslen(name) + 2 >= MAX_PATH) {
         return 0;
     }
-    file = &build->files[build->count];
-    ZeroMemory(file, sizeof *file);
-    file->video = video;
-    wcscpy_s(file->name, ZI_NAME, relative);
-    wcscpy_s(file->path, MAX_PATH, dir);
-    wcscat_s(file->path, MAX_PATH, L"\\");
-    wcscat_s(file->path, MAX_PATH, name);
-    build->count++;
-    if (build->count >= ZI_MAX_FILES) {
-        build->capped = 1;
-        return 1;
+    if (video) {
+        if (!zi_cat_reserve(&build->videos, &build->video_cap, build->video_count)) {
+            build->oom = 1;
+            return 1;
+        }
+        slot = &build->videos[build->video_count];
+    } else {
+        if (!zi_cat_reserve(&build->stills, &build->still_cap, build->still_count)) {
+            build->oom = 1;
+            return 1;
+        }
+        slot = &build->stills[build->still_count];
+    }
+    if (wcscpy_s(slot->name, ZI_NAME, relative) != 0) {
+        return 0;
+    }
+    if (wcscpy_s(slot->path, MAX_PATH, dir) != 0 ||
+        wcscat_s(slot->path, MAX_PATH, L"\\") != 0 ||
+        wcscat_s(slot->path, MAX_PATH, name) != 0) {
+        return 0;
+    }
+    slot->video = video;
+    if (video) {
+        build->video_count++;
+    } else {
+        build->still_count++;
     }
     return 0;
 }
@@ -396,8 +495,10 @@ static int zi_grid_collect(ZiListBuild *build, const wchar_t *directory, int dep
 
 static void zi_grid_start_thumbs(ZiApp *app) {
     ZiGridJob *job;
-    HANDLE thread;
+    HANDLE threads[4];
     int i;
+    int n;
+    int made = 0;
     int stills = 0;
 
     job = (ZiGridJob *)calloc(1, sizeof *job);
@@ -406,6 +507,7 @@ static void zi_grid_start_thumbs(ZiApp *app) {
     }
     job->hwnd = app->hwnd;
     job->generation = app->file_generation;
+    job->next = 0;
     for (i = 0; i < app->file_count; i++) {
         if (app->files[i].video) {
             job->path[i][0] = L'\0';
@@ -419,41 +521,258 @@ static void zi_grid_start_thumbs(ZiApp *app) {
         free(job);
         return;
     }
-    thread = CreateThread(NULL, 0, zi_grid_thread, job, 0, NULL);
-    if (thread) {
-        CloseHandle(thread);
-    } else {
+    for (n = 0; n < 4; n++) {
+        threads[n] = CreateThread(NULL, 0, zi_grid_thread, job, CREATE_SUSPENDED, NULL);
+        if (threads[n]) {
+            made++;
+        }
+    }
+    if (!made) {
         free(job);
+        return;
+    }
+    job->workers = made;
+    for (n = 0; n < 4; n++) {
+        if (!threads[n]) {
+            continue;
+        }
+        ResumeThread(threads[n]);
+        CloseHandle(threads[n]);
     }
 }
 
-static void zi_grid_take(ZiApp *app, ZiFile *files, int count, int capped, int failed) {
-    int i;
+static int zi_page_count_from(int filtered, int stills, int videos, int matches) {
+    int total;
 
-    zi_grid_free_files(app);
-    app->file_reading = 0;
-    if (failed) {
-        wcscpy_s(app->notice, 192, L"That folder could not be read.");
-        free(files);
+    if (filtered) {
+        total = matches;
+    } else if (stills <= 0 && videos > 0) {
+        return 1;
+    } else {
+        total = stills;
+    }
+    if (total <= 0) {
+        return 0;
+    }
+    return (total + ZI_PAGE_SIZE - 1) / ZI_PAGE_SIZE;
+}
+
+static void zi_file_from_cat(ZiFile *file, const ZiCatItem *item) {
+    ZeroMemory(file, sizeof *file);
+    file->video = item->video;
+    wcscpy_s(file->name, ZI_NAME, item->name);
+    wcscpy_s(file->path, MAX_PATH, item->path);
+}
+
+static int zi_notice_owned(const wchar_t *text) {
+    return wcscmp(text, L"Reading subfolders.") == 0 ||
+           wcscmp(text, L"The folder shows the first 200 photographs.") == 0 ||
+           wcscmp(text, L"The folder shows the first 20000 names.") == 0 ||
+           wcscmp(text, L"The folder shows the first 300 videos.") == 0 ||
+           wcscmp(text, L"The folder shows the first 20000 names and the first 300 videos.") == 0 ||
+           wcscmp(text, L"No photos match that name.") == 0;
+}
+
+static void zi_grid_apply_notice(ZiApp *app) {
+    int cut_videos = !app->file_filtered && g_video_count > ZI_VIDEO_PAGE;
+
+    if (app->file_filtered && app->file_match_total <= 0) {
+        wcscpy_s(app->notice, 192, L"No photos match that name.");
         return;
     }
-    if (count > ZI_MAX_FILES) {
-        count = ZI_MAX_FILES;
+    if (g_catalog_capped && cut_videos) {
+        wcscpy_s(app->notice, 192, L"The folder shows the first 20000 names and the first 300 videos.");
+        return;
     }
-    for (i = 0; i < count; i++) {
-        app->files[i] = files[i];
+    if (g_catalog_capped) {
+        wcscpy_s(app->notice, 192, L"The folder shows the first 20000 names.");
+        return;
     }
-    app->file_count = count;
-    free(files);
-    if (capped) {
-        wcscpy_s(app->notice, 192, L"The folder shows the first 200 photographs.");
-    } else if (wcscmp(app->notice, L"Reading subfolders.") == 0) {
+    if (cut_videos) {
+        wcscpy_s(app->notice, 192, L"The folder shows the first 300 videos.");
+        return;
+    }
+    if (zi_notice_owned(app->notice)) {
         app->notice[0] = L'\0';
     }
-    if (app->file_count > 1) {
-        qsort(app->files, (size_t)app->file_count, sizeof app->files[0], zi_file_less);
+}
+
+/* Page 0 mixes the first stills with videos, then sorts that page by name. Later pages are stills. */
+static void zi_grid_show_page(ZiApp *app) {
+    ZiPageSlice slice;
+    ZiCatItem **matched = NULL;
+    int match_total = 0;
+    int pages;
+    int video_n = 0;
+    int i;
+    int n = 0;
+
+    app->file_generation = InterlockedIncrement(&g_grid_generation);
+    zi_grid_free_files(app);
+    if (!g_have_catalog) {
+        app->file_still_total = 0;
+        app->file_video_total = 0;
+        app->file_match_total = 0;
+        app->file_page = 0;
+        return;
     }
+    app->file_still_total = g_still_count;
+    app->file_video_total = g_video_count;
+    app->file_filtered = app->name_filter[0] ? 1 : 0;
+    app->file_match_total = 0;
+    if (app->file_filtered && g_still_count + g_video_count > 0) {
+        matched = (ZiCatItem **)malloc((size_t)(g_still_count + g_video_count) * sizeof *matched);
+        if (!matched) {
+            wcscpy_s(app->notice, 192, L"That folder could not be read.");
+            return;
+        }
+        for (i = 0; i < g_still_count; i++) {
+            if (zi_name_match(g_stills[i].name, app->name_filter)) {
+                matched[match_total++] = &g_stills[i];
+            }
+        }
+        for (i = 0; i < g_video_count; i++) {
+            if (zi_name_match(g_videos[i].name, app->name_filter)) {
+                matched[match_total++] = &g_videos[i];
+            }
+        }
+        if (match_total > 1) {
+            qsort(matched, (size_t)match_total, sizeof *matched, zi_cat_ptr_less);
+        }
+    }
+    app->file_match_total = app->file_filtered ? match_total : 0;
+    pages = zi_page_count_from(app->file_filtered, app->file_still_total, app->file_video_total, app->file_match_total);
+    if (pages <= 0 || app->file_page < 0) {
+        app->file_page = 0;
+    } else if (app->file_page >= pages) {
+        app->file_page = pages - 1;
+    }
+    zi_page_slice(app->file_page, app->file_still_total, app->file_filtered, app->file_match_total, &slice);
+    if (app->file_filtered) {
+        for (i = 0; i < slice.filtered_count && n < ZI_MAX_FILES; i++) {
+            zi_file_from_cat(&app->files[n], matched[slice.filtered_begin + i]);
+            n++;
+        }
+    } else if (slice.include_videos) {
+        video_n = g_video_count;
+        if (video_n > ZI_VIDEO_PAGE) {
+            video_n = ZI_VIDEO_PAGE;
+        }
+        for (i = 0; i < slice.still_count && n < ZI_MAX_FILES; i++) {
+            zi_file_from_cat(&app->files[n], &g_stills[slice.still_begin + i]);
+            n++;
+        }
+        for (i = 0; i < video_n && n < ZI_MAX_FILES; i++) {
+            zi_file_from_cat(&app->files[n], &g_videos[i]);
+            n++;
+        }
+        if (n > 1) {
+            qsort(app->files, (size_t)n, sizeof app->files[0], zi_file_name_less);
+        }
+    } else {
+        for (i = 0; i < slice.still_count && n < ZI_MAX_FILES; i++) {
+            zi_file_from_cat(&app->files[n], &g_stills[slice.still_begin + i]);
+            n++;
+        }
+    }
+    app->file_count = n;
+    free(matched);
+    zi_grid_apply_notice(app);
     zi_grid_start_thumbs(app);
+}
+
+static void zi_build_free(ZiListBuild *build) {
+    free(build->stills);
+    free(build->videos);
+    build->stills = NULL;
+    build->videos = NULL;
+    build->still_cap = 0;
+    build->video_cap = 0;
+}
+
+static void zi_cat_sort_build(ZiListBuild *build) {
+    if (build->still_count > 1) {
+        qsort(build->stills, (size_t)build->still_count, sizeof(ZiCatItem), zi_cat_name_less);
+    }
+    if (build->video_count > 1) {
+        qsort(build->videos, (size_t)build->video_count, sizeof(ZiCatItem), zi_cat_name_less);
+    }
+}
+
+static ZiCatPack *zi_cat_pack(const ZiListBuild *build) {
+    size_t n = (size_t)build->still_count + (size_t)build->video_count;
+    size_t bytes = sizeof(ZiCatPack);
+    ZiCatPack *pack;
+
+    if (n > 1) {
+        bytes += (n - 1) * sizeof(ZiCatItem);
+    }
+    pack = (ZiCatPack *)malloc(bytes);
+    if (!pack) {
+        return NULL;
+    }
+    pack->still_count = build->still_count;
+    pack->video_count = build->video_count;
+    if (build->still_count > 0) {
+        memcpy(pack->items, build->stills, (size_t)build->still_count * sizeof(ZiCatItem));
+    }
+    if (build->video_count > 0) {
+        memcpy(pack->items + build->still_count, build->videos, (size_t)build->video_count * sizeof(ZiCatItem));
+    }
+    return pack;
+}
+
+static void zi_catalog_drop(void) {
+    free(g_pack);
+    g_pack = NULL;
+    g_stills = NULL;
+    g_videos = NULL;
+    g_still_count = 0;
+    g_video_count = 0;
+    g_catalog_capped = 0;
+    g_have_catalog = 0;
+}
+
+static void zi_grid_clear_counts(ZiApp *app) {
+    app->file_page = 0;
+    app->file_still_total = 0;
+    app->file_video_total = 0;
+    app->file_match_total = 0;
+    app->file_filtered = 0;
+}
+
+static void zi_grid_adopt(ZiApp *app, ZiCatPack *pack, int capped, int failed) {
+    app->file_reading = 0;
+    if (failed || !pack) {
+        free(pack);
+        zi_catalog_drop();
+        zi_grid_free_files(app);
+        zi_grid_clear_counts(app);
+        wcscpy_s(app->notice, 192, L"That folder could not be read.");
+        return;
+    }
+    zi_catalog_drop();
+    g_pack = pack;
+    g_still_count = pack->still_count;
+    g_video_count = pack->video_count;
+    if (g_still_count < 0) {
+        g_still_count = 0;
+    }
+    if (g_video_count < 0) {
+        g_video_count = 0;
+    }
+    if (g_still_count > ZI_CATALOG_CAP) {
+        g_still_count = ZI_CATALOG_CAP;
+    }
+    if (g_still_count + g_video_count > ZI_CATALOG_CAP) {
+        g_video_count = ZI_CATALOG_CAP - g_still_count;
+    }
+    g_stills = g_pack->items;
+    g_videos = g_pack->items + g_still_count;
+    g_catalog_capped = capped;
+    g_have_catalog = 1;
+    app->file_page = 0;
+    zi_grid_show_page(app);
 }
 
 typedef struct ZiListJob {
@@ -467,36 +786,53 @@ static DWORD WINAPI zi_list_thread(LPVOID param) {
     ZiListJob *job = (ZiListJob *)param;
     ZiListBuild build;
     ZiListNote *note;
+    ZiCatPack *pack = NULL;
     int result;
+    int capped;
+    int failed;
 
     ZeroMemory(&build, sizeof build);
     build.generation = job->generation;
     build.nested = job->nested;
     wcscpy_s(build.root, MAX_PATH, job->dir);
-    build.files = (ZiFile *)calloc(ZI_MAX_FILES, sizeof(ZiFile));
-    if (!build.files) {
+    result = zi_grid_collect(&build, job->dir, 0);
+    if (!g_grid_alive || job->generation != g_grid_generation) {
+        zi_build_free(&build);
         free(job);
         return 0;
     }
-    result = zi_grid_collect(&build, job->dir, 0);
+    capped = build.capped;
+    failed = result < 0 || build.oom;
+    if (!failed) {
+        zi_cat_sort_build(&build);
+        pack = zi_cat_pack(&build);
+        if (!pack) {
+            failed = 1;
+        }
+    }
+    zi_build_free(&build);
     if (!g_grid_alive || job->generation != g_grid_generation) {
-        free(build.files);
+        free(pack);
         free(job);
         return 0;
     }
     note = (ZiListNote *)calloc(1, sizeof *note);
     if (!note) {
-        free(build.files);
+        free(pack);
         free(job);
         return 0;
     }
     note->generation = job->generation;
-    note->failed = result < 0;
-    note->capped = build.capped;
-    note->count = build.count;
-    note->files = build.files;
+    note->failed = failed;
+    note->capped = capped;
+    note->count = pack ? pack->still_count + pack->video_count : 0;
+    /* One heap block of light names. The UI adopts it; a dropped window frees it. */
+    note->files = failed ? NULL : (ZiFile *)pack;
+    if (failed) {
+        free(pack);
+    }
     if (!PostMessageW(job->hwnd, ZI_WM_LIST, 0, (LPARAM)note)) {
-        free(build.files);
+        free(note->files);
         free(note);
     }
     free(job);
@@ -506,8 +842,10 @@ static DWORD WINAPI zi_list_thread(LPVOID param) {
 static void zi_grid_list(ZiApp *app, const wchar_t *directory, int nested) {
     ZiListBuild build;
     ZiListJob *job;
+    ZiCatPack *pack;
     HANDLE thread;
     int result;
+    int capped;
 
     app->file_nested = nested;
     if (nested) {
@@ -537,13 +875,21 @@ static void zi_grid_list(ZiApp *app, const wchar_t *directory, int nested) {
     build.generation = app->file_generation;
     build.nested = 0;
     wcscpy_s(build.root, MAX_PATH, directory);
-    build.files = (ZiFile *)calloc(ZI_MAX_FILES, sizeof(ZiFile));
-    if (!build.files) {
-        wcscpy_s(app->notice, 192, L"That folder could not be read.");
+    result = zi_grid_collect(&build, directory, 0);
+    capped = build.capped;
+    if (result < 0 || build.oom) {
+        zi_build_free(&build);
+        zi_grid_adopt(app, NULL, 0, 1);
         return;
     }
-    result = zi_grid_collect(&build, directory, 0);
-    zi_grid_take(app, build.files, build.count, build.capped, result < 0);
+    zi_cat_sort_build(&build);
+    pack = zi_cat_pack(&build);
+    zi_build_free(&build);
+    if (!pack) {
+        zi_grid_adopt(app, NULL, 0, 1);
+        return;
+    }
+    zi_grid_adopt(app, pack, capped, 0);
 }
 
 void zi_grid_install(ZiApp *app, ZiFile *files, int count) {
@@ -551,8 +897,10 @@ void zi_grid_install(ZiApp *app, ZiFile *files, int count) {
     int i;
 
     app->file_generation = generation;
+    zi_catalog_drop();
     zi_grid_free_files(app);
     app->file_reading = 0;
+    zi_grid_clear_counts(app);
     if (!files || count < 0) {
         count = 0;
     }
@@ -564,6 +912,7 @@ void zi_grid_install(ZiApp *app, ZiFile *files, int count) {
         files[i].thumb = NULL;
     }
     app->file_count = count;
+    app->file_still_total = count;
     free(files);
     zi_grid_start_thumbs(app);
 }
@@ -572,9 +921,11 @@ void zi_grid_clear(ZiApp *app) {
     LONG generation = InterlockedIncrement(&g_grid_generation);
 
     app->file_generation = generation;
+    zi_catalog_drop();
     zi_grid_free_files(app);
     app->file_dir[0] = L'\0';
     app->file_reading = 0;
+    zi_grid_clear_counts(app);
 }
 
 void zi_grid_load(ZiApp *app) {
@@ -592,9 +943,11 @@ void zi_grid_load(ZiApp *app) {
     if (!app->hwnd || !zi_current_folder(app, dir, MAX_PATH)) {
         generation = InterlockedIncrement(&g_grid_generation);
         app->file_generation = generation;
+        zi_catalog_drop();
         zi_grid_free_files(app);
         app->file_dir[0] = L'\0';
         app->file_reading = 0;
+        zi_grid_clear_counts(app);
         return;
     }
     /* The Mac library lists every still under the selected folder. Photos 2022
@@ -606,23 +959,32 @@ void zi_grid_load(ZiApp *app) {
     }
     generation = InterlockedIncrement(&g_grid_generation);
     app->file_generation = generation;
+    zi_catalog_drop();
     zi_grid_free_files(app);
     app->notice[0] = L'\0';
+    zi_grid_clear_counts(app);
     wcscpy_s(app->file_dir, MAX_PATH, dir);
     zi_grid_list(app, dir, nested);
 }
 
 void zi_grid_accept(ZiApp *app, ZiListNote *note) {
+    ZiCatPack *pack;
+
     if (!note) {
         return;
     }
+    pack = (ZiCatPack *)note->files;
+    note->files = NULL;
     if (!app || note->generation != app->file_generation) {
-        free(note->files);
+        free(pack);
         free(note);
         return;
     }
-    zi_grid_take(app, note->files, note->count, note->capped, note->failed);
-    note->files = NULL;
+    if (note->failed) {
+        free(pack);
+        pack = NULL;
+    }
+    zi_grid_adopt(app, pack, note->capped, note->failed);
     free(note);
     if (app->hwnd) {
         InvalidateRect(app->hwnd, NULL, FALSE);
@@ -632,6 +994,7 @@ void zi_grid_accept(ZiApp *app, ZiListNote *note) {
 void zi_grid_shutdown(ZiApp *app) {
     g_grid_alive = 0;
     InterlockedIncrement(&g_grid_generation);
+    zi_catalog_drop();
     zi_grid_free_files(app);
     if (g_vscroll) {
         DestroyWindow(g_vscroll);
@@ -1000,6 +1363,10 @@ void zi_grid_paint(ZiApp *app, HDC hdc) {
 
             if (app->file_reading) {
                 empty = L"Reading subfolders.";
+            } else if (wcscmp(app->notice, L"That folder could not be read.") == 0) {
+                empty = app->notice;
+            } else if (g_have_catalog && app->file_filtered) {
+                empty = L"No photos match that name.";
             } else if (app->grid_note[0]) {
                 empty = app->grid_note;
             }
@@ -1292,4 +1659,360 @@ void zi_grid_preview_drag(ZiApp *app, int x) {
     if (app->hwnd) {
         InvalidateRect(app->hwnd, NULL, FALSE);
     }
+}
+
+static void zi_grid_invalidate(ZiApp *app) {
+    if (app->hwnd) {
+        InvalidateRect(app->hwnd, NULL, FALSE);
+    }
+}
+
+void zi_grid_set_filter(ZiApp *app, const wchar_t *filter) {
+    if (!app) {
+        return;
+    }
+    if (!filter) {
+        filter = L"";
+    }
+    wcsncpy_s(app->name_filter, ZI_NAME, filter, _TRUNCATE);
+    app->file_filtered = app->name_filter[0] ? 1 : 0;
+    app->file_page = 0;
+    if (g_have_catalog) {
+        zi_grid_show_page(app);
+    }
+    zi_grid_invalidate(app);
+}
+
+void zi_grid_set_page(ZiApp *app, int page) {
+    int pages;
+
+    if (!app || !g_have_catalog) {
+        return;
+    }
+    pages = zi_grid_page_count(app);
+    if (pages <= 0) {
+        return;
+    }
+    if (page < 0) {
+        page = 0;
+    }
+    if (page >= pages) {
+        page = pages - 1;
+    }
+    app->file_page = page;
+    zi_grid_show_page(app);
+    zi_grid_invalidate(app);
+}
+
+int zi_grid_still_total(const ZiApp *app) {
+    return app ? app->file_still_total : 0;
+}
+
+int zi_grid_video_total(const ZiApp *app) {
+    return app ? app->file_video_total : 0;
+}
+
+int zi_grid_page_count(const ZiApp *app) {
+    if (!app || !g_have_catalog) {
+        return 0;
+    }
+    return zi_page_count_from(app->file_filtered, app->file_still_total, app->file_video_total,
+                              app->file_match_total);
+}
+
+static const unsigned long long k_preview_bytes = 200ull * 1024ull * 1024ull;
+
+typedef struct ZiPrevRec {
+    wchar_t name[MAX_PATH];
+    unsigned long long size;
+    FILETIME when;
+} ZiPrevRec;
+
+static int zi_preview_older(const void *a, const void *b) {
+    const ZiPrevRec *fa = (const ZiPrevRec *)a;
+    const ZiPrevRec *fb = (const ZiPrevRec *)b;
+
+    return CompareFileTime(&fa->when, &fb->when);
+}
+
+static int zi_preview_folder(wchar_t *dest, size_t cap) {
+    wchar_t temp[MAX_PATH];
+    wchar_t parent[MAX_PATH];
+
+    if (!GetTempPathW(MAX_PATH, temp)) {
+        return 0;
+    }
+    if (swprintf_s(parent, MAX_PATH, L"%sZImageWin", temp) < 0) {
+        return 0;
+    }
+    CreateDirectoryW(parent, NULL);
+    if (swprintf_s(dest, cap, L"%s\\previews", parent) < 0) {
+        return 0;
+    }
+    CreateDirectoryW(dest, NULL);
+    return 1;
+}
+
+static void zi_preview_evict(const wchar_t *folder) {
+    WIN32_FIND_DATAW found;
+    HANDLE search;
+    wchar_t pattern[MAX_PATH];
+    ZiPrevRec *recs = NULL;
+    int count = 0;
+    int cap = 0;
+    int i;
+    unsigned long long total = 0;
+
+    if (swprintf_s(pattern, MAX_PATH, L"%s\\*.jpg", folder) < 0) {
+        return;
+    }
+    search = FindFirstFileW(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        free(recs);
+        return;
+    }
+    do {
+        ZiPrevRec *grown;
+        unsigned long long bytes;
+
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+        if (count >= cap) {
+            int next = cap > 0 ? cap * 2 : 64;
+
+            grown = (ZiPrevRec *)realloc(recs, (size_t)next * sizeof *grown);
+            if (!grown) {
+                break;
+            }
+            recs = grown;
+            cap = next;
+        }
+        if (wcscpy_s(recs[count].name, MAX_PATH, found.cFileName) != 0) {
+            continue;
+        }
+        bytes = ((unsigned long long)found.nFileSizeHigh << 32) | found.nFileSizeLow;
+        recs[count].size = bytes;
+        recs[count].when = found.ftLastWriteTime;
+        total += bytes;
+        count++;
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+    if (count > 1) {
+        qsort(recs, (size_t)count, sizeof *recs, zi_preview_older);
+    }
+    for (i = 0; total > k_preview_bytes && i < count - 1; i++) {
+        wchar_t path[MAX_PATH];
+
+        if (swprintf_s(path, MAX_PATH, L"%s\\%s", folder, recs[i].name) < 0) {
+            continue;
+        }
+        if (DeleteFileW(path)) {
+            if (total >= recs[i].size) {
+                total -= recs[i].size;
+            } else {
+                total = 0;
+            }
+        }
+    }
+    free(recs);
+}
+
+static int zi_preview_leaf(const wchar_t *path, wchar_t *leaf, size_t cap) {
+    unsigned char digest[32];
+    char hex[65];
+    int i;
+
+    if (!path || !path[0] || cap < 70) {
+        return 0;
+    }
+    if (!zi_blake3_hash(path, wcslen(path) * sizeof(wchar_t), digest)) {
+        return 0;
+    }
+    zi_blake3_hex(digest, hex);
+    for (i = 0; i < 64; i++) {
+        leaf[i] = (wchar_t)hex[i];
+    }
+    leaf[64] = L'\0';
+    if (wcscat_s(leaf, cap, L".jpg") != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int zi_save_thumb_jpeg(IWICImagingFactory *factory, HBITMAP bitmap, const wchar_t *dest) {
+    IWICBitmap *wic = NULL;
+    IWICStream *stream = NULL;
+    IWICBitmapEncoder *encoder = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    IPropertyBag2 *props = NULL;
+    PROPBAG2 option;
+    VARIANT setting;
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    UINT w = 0;
+    UINT h = 0;
+    int ok = 0;
+
+    if (FAILED(factory->lpVtbl->CreateBitmapFromHBITMAP(factory, bitmap, NULL, WICBitmapIgnoreAlpha, &wic)) || !wic) {
+        goto done;
+    }
+    if (FAILED(wic->lpVtbl->GetSize(wic, &w, &h)) || w == 0 || h == 0) {
+        goto done;
+    }
+    if (FAILED(factory->lpVtbl->CreateStream(factory, &stream)) ||
+        FAILED(stream->lpVtbl->InitializeFromFilename(stream, dest, GENERIC_WRITE))) {
+        goto done;
+    }
+    if (FAILED(factory->lpVtbl->CreateEncoder(factory, &GUID_ContainerFormatJpeg, NULL, &encoder)) ||
+        FAILED(encoder->lpVtbl->Initialize(encoder, (IStream *)stream, WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->lpVtbl->CreateNewFrame(encoder, &frame, &props))) {
+        DeleteFileW(dest);
+        goto done;
+    }
+    ZeroMemory(&option, sizeof option);
+    option.pstrName = L"ImageQuality";
+    option.dwType = PROPBAG2_TYPE_DATA;
+    VariantInit(&setting);
+    setting.vt = VT_R4;
+    setting.fltVal = 0.7f;
+    if (props) {
+        props->lpVtbl->Write(props, 1, &option, &setting);
+    }
+    VariantClear(&setting);
+    if (FAILED(frame->lpVtbl->Initialize(frame, props)) || FAILED(frame->lpVtbl->SetSize(frame, w, h))) {
+        DeleteFileW(dest);
+        goto done;
+    }
+    frame->lpVtbl->SetPixelFormat(frame, &format);
+    if (FAILED(frame->lpVtbl->WriteSource(frame, (IWICBitmapSource *)wic, NULL)) ||
+        FAILED(frame->lpVtbl->Commit(frame)) || FAILED(encoder->lpVtbl->Commit(encoder))) {
+        DeleteFileW(dest);
+        goto done;
+    }
+    ok = 1;
+done:
+    if (frame) {
+        frame->lpVtbl->Release(frame);
+    }
+    if (props) {
+        props->lpVtbl->Release(props);
+    }
+    if (encoder) {
+        encoder->lpVtbl->Release(encoder);
+    }
+    if (stream) {
+        stream->lpVtbl->Release(stream);
+    }
+    if (wic) {
+        wic->lpVtbl->Release(wic);
+    }
+    return ok;
+}
+
+static void zi_preview_result(ZiApp *app, int photos, int built, int missed) {
+    const wchar_t *noun;
+
+    if (photos <= 0) {
+        wcscpy_s(app->notice, 192, L"This folder has no photos.");
+        return;
+    }
+    if (built <= 0 && missed <= 0) {
+        wcscpy_s(app->notice, 192, L"Every photo in this folder already has a preview.");
+        return;
+    }
+    if (built <= 0) {
+        wcscpy_s(app->notice, 192, L"No preview could be read.");
+        return;
+    }
+    noun = built == 1 ? L"preview" : L"previews";
+    if (missed <= 0) {
+        swprintf_s(app->notice, 192, L"Built %d %s.", built, noun);
+        return;
+    }
+    if (missed == 1) {
+        swprintf_s(app->notice, 192, L"Built %d %s. 1 photo could not be read.", built, noun);
+        return;
+    }
+    swprintf_s(app->notice, 192, L"Built %d %s. %d photos could not be read.", built, noun, missed);
+}
+
+void zi_grid_build_previews(ZiApp *app) {
+    wchar_t folder[MAX_PATH];
+    IWICImagingFactory *factory = NULL;
+    HRESULT com;
+    int balance;
+    int built = 0;
+    int missed = 0;
+    int i;
+
+    if (!app) {
+        return;
+    }
+    if (app->source_server) {
+        wcscpy_s(app->notice, 192, L"Server previews stay on the NAS.");
+        zi_grid_invalidate(app);
+        return;
+    }
+    if (app->file_filtered || app->name_filter[0]) {
+        wcscpy_s(app->notice, 192, L"Clear the name filter before building previews.");
+        zi_grid_invalidate(app);
+        return;
+    }
+    if (!g_have_catalog || g_still_count <= 0) {
+        wcscpy_s(app->notice, 192, L"This folder has no photos.");
+        zi_grid_invalidate(app);
+        return;
+    }
+    if (!zi_preview_folder(folder, MAX_PATH)) {
+        wcscpy_s(app->notice, 192, L"No preview could be read.");
+        zi_grid_invalidate(app);
+        return;
+    }
+    com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    balance = com == S_OK || com == S_FALSE;
+    CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
+                     (void **)&factory);
+    for (i = 0; factory && i < g_still_count; i++) {
+        wchar_t leaf[80];
+        wchar_t dest[MAX_PATH];
+        HBITMAP bitmap;
+        DWORD attr;
+        int tw = 0;
+        int th = 0;
+
+        if (g_stills[i].video || !g_stills[i].path[0]) {
+            continue;
+        }
+        if (!zi_preview_leaf(g_stills[i].path, leaf, 80) ||
+            swprintf_s(dest, MAX_PATH, L"%s\\%s", folder, leaf) < 0) {
+            missed++;
+            continue;
+        }
+        attr = GetFileAttributesW(dest);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            continue;
+        }
+        bitmap = zi_decode_thumb(factory, g_stills[i].path, &tw, &th);
+        if (!bitmap || tw < 1 || th < 1 || !zi_save_thumb_jpeg(factory, bitmap, dest)) {
+            if (bitmap) {
+                DeleteObject(bitmap);
+            }
+            missed++;
+            continue;
+        }
+        DeleteObject(bitmap);
+        built++;
+    }
+    if (!factory) {
+        missed = g_still_count;
+    }
+    zi_preview_evict(folder);
+    if (factory) {
+        factory->lpVtbl->Release(factory);
+    }
+    if (balance) {
+        CoUninitialize();
+    }
+    zi_preview_result(app, g_still_count, built, missed);
+    zi_grid_invalidate(app);
 }

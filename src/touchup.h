@@ -8,6 +8,7 @@
 #define ZI_TOUCH_CAP 64
 #define ZI_TOUCH_DUST "touchup-dust-v1"
 #define ZI_TOUCH_SCRATCH "touchup-scratch-v1"
+#define ZI_TOUCH_REDEYE "touchup-redeye-v1"
 
 typedef struct ZiTouchMask {
     volatile long refs;
@@ -22,6 +23,11 @@ typedef struct ZiTouchOp {
     float feather;
     float strength;
     ZiTouchMask *mask;
+    /* 0 means the mask already matches the buffer it was drawn on. */
+    int has_orient;
+    int mask_turns;
+    int mask_flip_h;
+    int mask_flip_v;
 } ZiTouchOp;
 
 typedef struct ZiTouchDoc {
@@ -48,14 +54,18 @@ int zi_touch_one_added(const ZiTouchDoc *prev, const ZiTouchDoc *next);
 /* 1 when the masks match and exactly one strength changed. Writes the op index. */
 int zi_touch_one_strength(const ZiTouchDoc *prev, const ZiTouchDoc *next, int *index);
 
-/* RGB float, row 0 at the top, three channels. NULL doc is a no-op. */
-void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc);
+/* RGB float, row 0 at the top, three channels. NULL doc is a no-op.
+   turns and flips are the display orientation. A recorded mask is reoriented on a temporary copy. */
+void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc, int turns, int flip_h, int flip_v);
+/* Records the orientation a mask was drawn on, once, before that orientation changes. */
+void zi_touch_capture_orient(ZiTouchDoc *doc, int turns, int flip_h, int flip_v);
 
 /* 1 mask, 0 nothing stood out, -1 the removal did not run. */
 int zi_touch_dust_mask(const float *rgb, int w, int h, unsigned char **mask);
 int zi_touch_scratch_mask(const float *rgb, int w, int h, unsigned char **mask);
 int zi_touch_spot_mask(const float *rgb, int w, int h, int x, int y, int radius, unsigned char **mask);
 int zi_touch_stroke_mask(int w, int h, const int *xs, const int *ys, int count, int radius, unsigned char **mask);
+int zi_touch_redeye_mask(const float *rgb, int w, int h, int x, int y, unsigned char **mask);
 
 /* Mac PNG: row 0 is the bottom of the photo. The returned mask is top-down. */
 int zi_touch_mask_png(const ZiTouchMask *mask, unsigned char **png, size_t *png_len);

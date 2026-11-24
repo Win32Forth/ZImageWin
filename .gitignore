@@ -9,3 +9,5 @@ build/
 dist/*
 !dist/ZImager-1.0.0-arm64.exe
 !dist/ZImager-1.0.0-x64.exe
+!dist/ZImager-1.8.6-arm64.exe
+!dist/ZImager-1.8.6-x64.exe

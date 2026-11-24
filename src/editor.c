@@ -5,6 +5,8 @@
 #include "library.h"
 #include "tone.h"
 #include "touchup.h"
+#include "media.h"
+#include "folders.h"
 #include "zimg.h"
 #include "blake3.h"
 
@@ -48,6 +50,7 @@ static int g_spot_running;
 static void zi_grade_request(ZiApp *app);
 static void zi_editor_refresh(ZiApp *app);
 static int zi_photo_dest(const ZiApp *app, RECT *dest);
+static void zi_blit_fit(HDC hdc, HBITMAP bitmap, int bw, int bh, int x, int y, int box_w, int box_h);
 static int zi_view_point(const ZiApp *app, int x, int y, int *px, int *py);
 static void zi_drop_begin(ZiApp *app, int x, int y);
 static void zi_edits_note(ZiApp *app);
@@ -70,6 +73,21 @@ static ZiTouchDoc g_doc_docs[ZI_HIST];
 static int g_doc_len;
 static int g_doc_pos;
 static int g_export_format;
+static int g_modal;
+
+static int *g_pdf_pages;
+static int g_pdf_count;
+static int g_pdf_pick = -1;
+static RECT *g_pdf_rects;
+static int g_pdf_rect_cap;
+static int g_pdf_rect_count;
+static HBITMAP *g_pdf_thumbs;
+static int g_pdf_thumb_count;
+static volatile LONG g_pdf_gen;
+static int g_pdf_wait;
+static int g_pdf_request_page;
+static CRITICAL_SECTION g_pdf_cs;
+static int g_pdf_cs_ready;
 
 #define ZI_TURN_CAP 256
 #define ZI_VIEW_EDGE 2560
@@ -105,6 +123,22 @@ static int zi_is_video_name(const wchar_t *name) {
         }
     }
     return 0;
+}
+
+static int zi_ext_is(const wchar_t *path, const wchar_t *ext) {
+    const wchar_t *base;
+    const wchar_t *dot;
+
+    if (!path || !ext) {
+        return 0;
+    }
+    base = wcsrchr(path, L'\\');
+    base = (base && base[1]) ? base + 1 : path;
+    dot = wcsrchr(base, L'.');
+    if (!dot || dot[1] == L'\0') {
+        return 0;
+    }
+    return _wcsicmp(dot + 1, ext) == 0;
 }
 
 static ZiTone zi_edit_get(const wchar_t *path) {
@@ -353,13 +387,109 @@ done:
     return dib;
 }
 
-static HBITMAP zi_decode_file(IWICImagingFactory *factory, const wchar_t *path, int max_edge, int turns,
-                              int *out_w, int *out_h) {
+static HBITMAP zi_decode_bytes(IWICImagingFactory *factory, const unsigned char *bytes, size_t len,
+                               int max_edge, int turns, int *out_w, int *out_h) {
+    HGLOBAL memory = NULL;
+    void *locked = NULL;
+    IStream *stream = NULL;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    HBITMAP dib = NULL;
+    int orientation = 1;
+
+    if (!factory || !bytes || len == 0 || len > 0x7fffffff) {
+        return NULL;
+    }
+    memory = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)len);
+    if (!memory) {
+        return NULL;
+    }
+    locked = GlobalLock(memory);
+    if (!locked) {
+        GlobalFree(memory);
+        return NULL;
+    }
+    memcpy(locked, bytes, len);
+    GlobalUnlock(memory);
+    if (FAILED(CreateStreamOnHGlobal(memory, TRUE, &stream)) || !stream) {
+        GlobalFree(memory);
+        return NULL;
+    }
+    if (FAILED(factory->lpVtbl->CreateDecoderFromStream(factory, stream, NULL, WICDecodeMetadataCacheOnLoad,
+                                                        &decoder)) ||
+        !decoder || FAILED(decoder->lpVtbl->GetFrame(decoder, 0, &frame)) || !frame) {
+        goto done;
+    }
+    orientation = zi_frame_orientation(frame);
+    dib = zi_decode_source(factory, (IWICBitmapSource *)frame, orientation, max_edge, turns, out_w, out_h);
+done:
+    if (frame) {
+        frame->lpVtbl->Release(frame);
+    }
+    if (decoder) {
+        decoder->lpVtbl->Release(decoder);
+    }
+    if (stream) {
+        stream->lpVtbl->Release(stream);
+    }
+    return dib;
+}
+
+static void zi_copy_notice(wchar_t *dest, size_t cap, const wchar_t *text) {
+    if (!dest || cap == 0) {
+        return;
+    }
+    if (!text || !text[0]) {
+        dest[0] = L'\0';
+        return;
+    }
+    wcscpy_s(dest, cap, text);
+}
+
+static HBITMAP zi_decode_still(IWICImagingFactory *factory, const wchar_t *path, int max_edge, int turns,
+                               int *out_w, int *out_h, wchar_t *notice, size_t notice_cap) {
     IWICBitmapDecoder *decoder = NULL;
     IWICBitmapFrameDecode *frame = NULL;
     HBITMAP dib = NULL;
     int orientation;
+    unsigned char *jpeg = NULL;
+    size_t jpeg_len = 0;
+    wchar_t reported[192];
 
+    if (notice && notice_cap > 0) {
+        notice[0] = L'\0';
+    }
+    if (!factory || !path || !path[0]) {
+        return NULL;
+    }
+    if (zi_ext_is(path, L"x3i") || zi_ext_is(path, L"pdf")) {
+        zi_copy_notice(notice, notice_cap,
+                       zi_ext_is(path, L"pdf") ? L"That PDF page could not be drawn on this PC."
+                                               : L"This photograph could not be opened.");
+        return NULL;
+    }
+    if (zi_ext_is(path, L"x3f")) {
+        reported[0] = L'\0';
+        if (!zi_x3f_embedded_jpeg(path, &jpeg, &jpeg_len, reported, 192) || !jpeg || jpeg_len == 0) {
+            free(jpeg);
+            if (reported[0]) {
+                zi_copy_notice(notice, notice_cap, reported);
+            } else {
+                zi_copy_notice(notice, notice_cap, L"This photograph could not be opened.");
+            }
+            return NULL;
+        }
+        dib = zi_decode_bytes(factory, jpeg, jpeg_len, max_edge, turns, out_w, out_h);
+        free(jpeg);
+        if (!dib) {
+            zi_copy_notice(notice, notice_cap, L"This photograph could not be opened.");
+            return NULL;
+        }
+        if (reported[0]) {
+            zi_copy_notice(notice, notice_cap, reported);
+        }
+        return dib;
+    }
     if (FAILED(factory->lpVtbl->CreateDecoderFromFilename(factory, path, NULL, GENERIC_READ,
                                                           WICDecodeMetadataCacheOnLoad, &decoder)) ||
         FAILED(decoder->lpVtbl->GetFrame(decoder, 0, &frame))) {
@@ -375,6 +505,11 @@ done:
         decoder->lpVtbl->Release(decoder);
     }
     return dib;
+}
+
+static HBITMAP zi_decode_file(IWICImagingFactory *factory, const wchar_t *path, int max_edge, int turns,
+                              int *out_w, int *out_h) {
+    return zi_decode_still(factory, path, max_edge, turns, out_w, out_h, NULL, 0);
 }
 
 static HBITMAP zi_copy_turned(HBITMAP src, int quarters) {
@@ -820,6 +955,11 @@ static void zi_clear_grade_fields(ZiTone *tone) {
     tone->has_skin = 0;
     tone->skin_delta_a = 0;
     tone->skin_delta_b = 0;
+    tone->details = 0;
+    zi_curves_identity(&tone->curves);
+    tone->vignette_amount = 0;
+    tone->vignette_mid = 0.5;
+    tone->vignette_feather = 0.5;
 }
 
 /* Geometry and repairs. The tone stack is cleared so the sample is stage 3. */
@@ -1275,17 +1415,234 @@ static void zi_apply_edit(ZiApp *app, const wchar_t *path, const ZiTone *tone) {
     zi_editor_refresh(app);
 }
 
-static void zi_open_video(ZiApp *app, const wchar_t *path) {
-    HINSTANCE opened = ShellExecuteW(app->hwnd, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+static void zi_clear_marquee(ZiApp *app);
 
-    if ((INT_PTR)opened <= 32) {
-        zi_editor_notice(app, L"That video could not be opened.");
+static void zi_pdf_lock(void) {
+    if (!g_pdf_cs_ready) {
+        InitializeCriticalSection(&g_pdf_cs);
+        g_pdf_cs_ready = 1;
     }
+    EnterCriticalSection(&g_pdf_cs);
+}
+
+static void zi_pdf_unlock(void) {
+    LeaveCriticalSection(&g_pdf_cs);
+}
+
+static void zi_pdf_release(void) {
+    int i;
+    int *pages;
+    HBITMAP *thumbs;
+    int thumb_count;
+
+    InterlockedIncrement(&g_pdf_gen);
+    zi_pdf_lock();
+    pages = g_pdf_pages;
+    g_pdf_pages = NULL;
+    g_pdf_count = 0;
+    g_pdf_pick = -1;
+    g_pdf_rect_count = 0;
+    thumbs = g_pdf_thumbs;
+    thumb_count = g_pdf_thumb_count;
+    g_pdf_thumbs = NULL;
+    g_pdf_thumb_count = 0;
+    g_pdf_wait = 0;
+    g_pdf_request_page = 0;
+    zi_pdf_unlock();
+    free(pages);
+    if (thumbs) {
+        for (i = 0; i < thumb_count; i++) {
+            if (thumbs[i]) {
+                DeleteObject(thumbs[i]);
+            }
+        }
+        free(thumbs);
+    }
+}
+
+static int zi_pdf_hold_rects(int count) {
+    RECT *grown;
+
+    if (count <= g_pdf_rect_cap) {
+        return 1;
+    }
+    grown = (RECT *)realloc(g_pdf_rects, (size_t)count * sizeof(RECT));
+    if (!grown) {
+        return 0;
+    }
+    g_pdf_rects = grown;
+    g_pdf_rect_cap = count;
+    return 1;
+}
+
+static int zi_pdf_store(int *pages, int count) {
+    HBITMAP *thumbs;
+
+    if (!pages || count < 1) {
+        return 0;
+    }
+    if (!zi_pdf_hold_rects(count)) {
+        return 0;
+    }
+    thumbs = (HBITMAP *)calloc((size_t)count, sizeof(HBITMAP));
+    if (!thumbs) {
+        return 0;
+    }
+    zi_pdf_release();
+    zi_pdf_lock();
+    g_pdf_pages = pages;
+    g_pdf_count = count;
+    g_pdf_thumbs = thumbs;
+    g_pdf_thumb_count = count;
+    g_pdf_pick = -1;
+    zi_pdf_unlock();
+    return 1;
+}
+
+typedef struct ZiPdfThumbJob {
+    HWND hwnd;
+    LONG generation;
+    int count;
+    int *pages;
+    wchar_t path[MAX_PATH];
+} ZiPdfThumbJob;
+
+static DWORD WINAPI zi_pdf_thumb_thread(LPVOID param) {
+    ZiPdfThumbJob *job = (ZiPdfThumbJob *)param;
+    IWICImagingFactory *factory = NULL;
+    int i;
+    int limit;
+
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) {
+        free(job->pages);
+        free(job);
+        return 0;
+    }
+    CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
+                     (void **)&factory);
+    limit = job->count;
+    if (limit > 64) {
+        limit = 64;
+    }
+    for (i = 0; factory && i < limit; i++) {
+        unsigned char *jpeg = NULL;
+        size_t jpeg_len = 0;
+        HBITMAP dib = NULL;
+        int page;
+
+        if (job->generation != g_pdf_gen || !g_editor_alive) {
+            break;
+        }
+        page = zi_chosen_page(job->pages, job->count, i);
+        if (page <= 0 || !zi_pdf_page_jpeg(job->path, page, &jpeg, &jpeg_len) || !jpeg || jpeg_len == 0) {
+            free(jpeg);
+            continue;
+        }
+        int edge_w = 0;
+        int edge_h = 0;
+
+        dib = zi_decode_bytes(factory, jpeg, jpeg_len, 256, 0, &edge_w, &edge_h);
+        free(jpeg);
+        if (!dib) {
+            continue;
+        }
+        zi_pdf_lock();
+        if (job->generation != g_pdf_gen || !g_pdf_thumbs || i >= g_pdf_thumb_count || g_pdf_thumbs[i]) {
+            zi_pdf_unlock();
+            DeleteObject(dib);
+            if (job->generation != g_pdf_gen) {
+                break;
+            }
+            continue;
+        }
+        g_pdf_thumbs[i] = dib;
+        zi_pdf_unlock();
+        if (job->hwnd && job->generation == g_pdf_gen) {
+            InvalidateRect(job->hwnd, NULL, FALSE);
+        }
+    }
+    if (factory) {
+        factory->lpVtbl->Release(factory);
+    }
+    CoUninitialize();
+    free(job->pages);
+    free(job);
+    return 0;
+}
+
+static void zi_pdf_thumbs_start(ZiApp *app) {
+    ZiPdfThumbJob *job;
+    HANDLE thread;
+    int i;
+
+    if (!app || !app->hwnd || g_pdf_count < 1 || !g_pdf_pages) {
+        return;
+    }
+    job = (ZiPdfThumbJob *)calloc(1, sizeof *job);
+    if (!job) {
+        return;
+    }
+    job->pages = (int *)malloc((size_t)g_pdf_count * sizeof(int));
+    if (!job->pages) {
+        free(job);
+        return;
+    }
+    for (i = 0; i < g_pdf_count; i++) {
+        job->pages[i] = g_pdf_pages[i];
+    }
+    job->hwnd = app->hwnd;
+    job->generation = g_pdf_gen;
+    job->count = g_pdf_count;
+    wcscpy_s(job->path, MAX_PATH, app->photo_path);
+    thread = CreateThread(NULL, 0, zi_pdf_thumb_thread, job, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        free(job->pages);
+        free(job);
+    }
+}
+
+static void zi_open_video(ZiApp *app, const wchar_t *path) {
+    wchar_t before[192];
+
+    if (!app || !path || !path[0]) {
+        return;
+    }
+    before[0] = L'\0';
+    if (app->notice[0]) {
+        wcscpy_s(before, 192, app->notice);
+    }
+    if (!zi_media_open(app, path)) {
+        if (!app->notice[0] || wcscmp(app->notice, before) == 0) {
+            zi_editor_notice(app, L"This video could not be played on this PC.");
+        }
+        return;
+    }
+    app->pdf_picking = 0;
+    zi_pdf_release();
+    zi_editor_free_bitmaps(app);
+    app->photo_failed = 0;
+    app->photo_busy = 0;
+    app->select_tool = 0;
+    app->eyedropper_tool = 0;
+    app->horizon_tool = 0;
+    app->horizon_have = 0;
+    app->spot_tool = 0;
+    app->scratch_tool = 0;
+    app->scratch_drag = 0;
+    app->scratch_count = 0;
+    app->redeye_tool = 0;
+    app->hover_on = 0;
+    app->zoom_tool = 1;
+    zi_clear_marquee(app);
+    zi_editor_refresh(app);
 }
 
 typedef struct ZiPhotoJob {
     HWND hwnd;
     LONG generation;
+    int page;
     wchar_t path[MAX_PATH];
 } ZiPhotoJob;
 
@@ -1294,9 +1651,13 @@ static DWORD WINAPI zi_photo_thread(LPVOID param) {
     IWICImagingFactory *factory = NULL;
     ZiPhotoNote *note;
     HBITMAP bitmap = NULL;
+    unsigned char *jpeg = NULL;
+    size_t jpeg_len = 0;
     int w = 0;
     int h = 0;
+    wchar_t notice[192];
 
+    notice[0] = L'\0';
     if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) {
         free(job);
         return 0;
@@ -1304,8 +1665,23 @@ static DWORD WINAPI zi_photo_thread(LPVOID param) {
     if (g_editor_alive && job->generation == g_photo_generation) {
         CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                          &IID_IWICImagingFactory, (void **)&factory);
+        if (factory && job->page > 0) {
+            if (!zi_pdf_page_jpeg(job->path, job->page, &jpeg, &jpeg_len) || !jpeg || jpeg_len == 0) {
+                free(jpeg);
+                jpeg = NULL;
+                wcscpy_s(notice, 192, L"That PDF page could not be drawn on this PC.");
+            } else {
+                bitmap = zi_decode_bytes(factory, jpeg, jpeg_len, ZI_VIEW_EDGE, 0, &w, &h);
+                free(jpeg);
+                jpeg = NULL;
+                if (!bitmap) {
+                    wcscpy_s(notice, 192, L"That PDF page could not be drawn on this PC.");
+                }
+            }
+        } else if (factory) {
+            bitmap = zi_decode_still(factory, job->path, ZI_VIEW_EDGE, 0, &w, &h, notice, 192);
+        }
         if (factory) {
-            bitmap = zi_decode_file(factory, job->path, ZI_VIEW_EDGE, 0, &w, &h);
             factory->lpVtbl->Release(factory);
         }
     }
@@ -1331,6 +1707,9 @@ static DWORD WINAPI zi_photo_thread(LPVOID param) {
     note->w = w;
     note->h = h;
     note->bitmap = bitmap;
+    if (notice[0]) {
+        wcscpy_s(note->notice, 192, notice);
+    }
     if (!PostMessageW(job->hwnd, ZI_WM_PHOTO, 0, (LPARAM)note)) {
         if (bitmap) {
             DeleteObject(bitmap);
@@ -1346,20 +1725,32 @@ static void zi_editor_start_photo(ZiApp *app) {
     ZiPhotoJob *job;
     HANDLE thread;
     LONG generation;
+    int page;
 
+    page = g_pdf_request_page;
+    g_pdf_request_page = 0;
     generation = InterlockedIncrement(&g_photo_generation);
     app->photo_generation = generation;
     if (!app->hwnd || !app->photo_path[0]) {
+        if (page > 0) {
+            app->photo_busy = 0;
+            app->photo_failed = 1;
+            zi_editor_notice(app, L"That PDF page could not be drawn on this PC.");
+        }
         return;
     }
     job = (ZiPhotoJob *)calloc(1, sizeof *job);
     if (!job) {
         app->photo_busy = 0;
         app->photo_failed = 1;
+        if (page > 0) {
+            zi_editor_notice(app, L"That PDF page could not be drawn on this PC.");
+        }
         return;
     }
     job->hwnd = app->hwnd;
     job->generation = generation;
+    job->page = page;
     wcscpy_s(job->path, MAX_PATH, app->photo_path);
     thread = CreateThread(NULL, 0, zi_photo_thread, job, 0, NULL);
     if (thread) {
@@ -1368,7 +1759,206 @@ static void zi_editor_start_photo(ZiApp *app) {
         free(job);
         app->photo_busy = 0;
         app->photo_failed = 1;
+        if (page > 0) {
+            zi_editor_notice(app, L"That PDF page could not be drawn on this PC.");
+        }
     }
+}
+
+static void zi_pdf_layout(ZiApp *app) {
+    RECT canvas;
+    int count;
+    int cols;
+    int rows;
+    int gap;
+    int tile;
+    int avail_w;
+    int avail_h;
+    int grid_w;
+    int grid_h;
+    int x0;
+    int y0;
+    int i;
+
+    g_pdf_rect_count = 0;
+    if (!app || !app->pdf_picking || g_pdf_count < 1) {
+        return;
+    }
+    canvas = app->regions.canvas;
+    if (app->notice[0]) {
+        canvas.top += zi_px(app, 28);
+    }
+    count = g_pdf_count;
+    if (!zi_pdf_hold_rects(count)) {
+        return;
+    }
+    gap = zi_px(app, 12);
+    if (gap < 4) {
+        gap = 4;
+    }
+    avail_w = canvas.right - canvas.left;
+    avail_h = canvas.bottom - canvas.top;
+    if (avail_w < 8 || avail_h < 8) {
+        return;
+    }
+    tile = zi_px(app, 160);
+    if (tile < 16) {
+        tile = 16;
+    }
+    cols = 1;
+    rows = count;
+    for (;;) {
+        int need_w;
+        int need_h;
+        int room;
+
+        if (cols > count) {
+            cols = count;
+        }
+        rows = (count + cols - 1) / cols;
+        need_w = cols * tile + (cols + 1) * gap;
+        need_h = rows * tile + (rows + 1) * gap;
+        if (need_w <= avail_w && need_h <= avail_h) {
+            break;
+        }
+        room = (avail_w - gap) / (tile + gap);
+        if (room < 1) {
+            room = 1;
+        }
+        if (cols < room && cols < count) {
+            cols++;
+            continue;
+        }
+        if (tile > 16) {
+            tile = (tile * 3) / 4;
+            if (tile < 16) {
+                tile = 16;
+            }
+            cols = 1;
+            continue;
+        }
+        if (cols < count) {
+            cols++;
+            continue;
+        }
+        break;
+    }
+    grid_w = cols * tile + (cols - 1) * gap;
+    grid_h = rows * tile + (rows - 1) * gap;
+    x0 = canvas.left + (avail_w - grid_w) / 2;
+    y0 = canvas.top + gap;
+    if (grid_h < avail_h) {
+        y0 = canvas.top + (avail_h - grid_h) / 2;
+    }
+    for (i = 0; i < count; i++) {
+        int col = i % cols;
+        int row = i / cols;
+
+        g_pdf_rects[i].left = x0 + col * (tile + gap);
+        g_pdf_rects[i].top = y0 + row * (tile + gap);
+        g_pdf_rects[i].right = g_pdf_rects[i].left + tile;
+        g_pdf_rects[i].bottom = g_pdf_rects[i].top + tile;
+    }
+    g_pdf_rect_count = count;
+}
+
+static void zi_paint_pdf_pages(ZiApp *app, HDC hdc) {
+    int i;
+    int saved;
+    RECT canvas;
+
+    if (!app || !hdc) {
+        return;
+    }
+    zi_pdf_layout(app);
+    canvas = app->regions.canvas;
+    saved = SaveDC(hdc);
+    IntersectClipRect(hdc, canvas.left, canvas.top, canvas.right, canvas.bottom);
+    zi_pdf_lock();
+    for (i = 0; i < g_pdf_rect_count && i < g_pdf_count; i++) {
+        RECT tile = g_pdf_rects[i];
+        RECT label;
+        RECT picture;
+        wchar_t text[32];
+        int page = g_pdf_pages ? g_pdf_pages[i] : 0;
+        HBITMAP thumb = (g_pdf_thumbs && i < g_pdf_thumb_count) ? g_pdf_thumbs[i] : NULL;
+        int label_h = zi_px(app, 22);
+        HBRUSH fill = (i == g_pdf_pick) ? app->panel : app->list_brush;
+
+        if (label_h < 16) {
+            label_h = 16;
+        }
+        if (fill) {
+            FillRect(hdc, &tile, fill);
+        }
+        picture = tile;
+        picture.bottom -= label_h;
+        if (picture.bottom < picture.top) {
+            picture.bottom = picture.top;
+        }
+        if (thumb) {
+            BITMAP bm;
+
+            if (GetObject(thumb, sizeof bm, &bm) == (int)sizeof bm && bm.bmWidth > 0 && bm.bmHeight > 0) {
+                zi_blit_fit(hdc, thumb, bm.bmWidth, bm.bmHeight, picture.left, picture.top,
+                            picture.right - picture.left, picture.bottom - picture.top);
+            }
+        }
+        label = tile;
+        label.top = tile.bottom - label_h;
+        swprintf_s(text, 32, L"%d", page);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, ZI_INK);
+        SelectObject(hdc, app->font);
+        DrawTextW(hdc, text, -1, &label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        FrameRect(hdc, &tile, (HBRUSH)GetStockObject(i == g_pdf_pick ? BLACK_BRUSH : GRAY_BRUSH));
+    }
+    zi_pdf_unlock();
+    RestoreDC(hdc, saved);
+}
+
+static int zi_pdf_index_at(ZiApp *app, int x, int y) {
+    POINT pt;
+    int i;
+
+    pt.x = x;
+    pt.y = y;
+    zi_pdf_layout(app);
+    for (i = 0; i < g_pdf_rect_count; i++) {
+        if (PtInRect(&g_pdf_rects[i], pt)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void zi_pdf_open_index(ZiApp *app, int index) {
+    int page = 0;
+
+    if (!app || index < 0) {
+        return;
+    }
+    zi_pdf_lock();
+    page = zi_chosen_page(g_pdf_pages, g_pdf_count, index);
+    zi_pdf_unlock();
+    zi_editor_free_bitmaps(app);
+    g_pdf_pick = index;
+    app->notice[0] = L'\0';
+    app->photo_failed = 0;
+    if (page <= 0) {
+        app->photo_busy = 0;
+        app->photo_failed = 1;
+        g_pdf_wait = 0;
+        g_pdf_request_page = 0;
+        zi_editor_notice(app, L"That PDF page could not be drawn on this PC.");
+        zi_editor_refresh(app);
+        return;
+    }
+    g_pdf_wait = 1;
+    g_pdf_request_page = page;
+    app->photo_busy = 1;
+    zi_editor_start_photo(app);
+    zi_editor_refresh(app);
 }
 
 static void zi_clear_marquee(ZiApp *app) {
@@ -1403,6 +1993,7 @@ void zi_editor_open_path(ZiApp *app, const wchar_t *path) {
         zi_open_video(app, path);
         return;
     }
+    zi_media_close(app);
     zi_editor_show_image(app);
     if (app->photo_path[0] && _wcsicmp(app->photo_path, path) == 0 &&
         (app->photo || app->photo_busy) && !app->photo_failed) {
@@ -1437,7 +2028,9 @@ void zi_editor_open_path(ZiApp *app, const wchar_t *path) {
     app->scratch_tool = 0;
     app->scratch_drag = 0;
     app->scratch_count = 0;
+    app->redeye_tool = 0;
     app->hover_on = 0;
+    app->pdf_picking = 0;
     app->touch_busy = 0;
     g_spot_q_len = 0;
     g_spot_running = 0;
@@ -1461,6 +2054,39 @@ void zi_editor_open_path(ZiApp *app, const wchar_t *path) {
     }
     app->notice[0] = L'\0';
     zi_editor_title(app);
+    zi_pdf_release();
+    if (zi_ext_is(path, L"pdf")) {
+        int *pages = NULL;
+        int page_count = 0;
+
+        app->photo_busy = 0;
+        if (!zi_pdf_list_pages(path, &pages, &page_count) || !pages || page_count < 1 ||
+            !zi_pdf_store(pages, page_count)) {
+            free(pages);
+            app->photo_failed = 1;
+            app->pdf_picking = 0;
+            zi_editor_notice(app, L"That PDF page could not be drawn on this PC.");
+        } else {
+            app->photo_failed = 0;
+            app->pdf_picking = 1;
+            zi_pdf_thumbs_start(app);
+        }
+        zi_queue_hash(app);
+        if (app->hwnd) {
+            InvalidateRect(app->hwnd, NULL, FALSE);
+        }
+        return;
+    }
+    if (zi_ext_is(path, L"x3i")) {
+        app->photo_busy = 0;
+        app->photo_failed = 1;
+        zi_editor_notice(app, L"This photograph could not be opened.");
+        zi_queue_hash(app);
+        if (app->hwnd) {
+            InvalidateRect(app->hwnd, NULL, FALSE);
+        }
+        return;
+    }
     zi_editor_start_photo(app);
     zi_queue_hash(app);
     if (app->hwnd) {
@@ -1517,15 +2143,25 @@ void zi_editor_on_photo(ZiApp *app, ZiPhotoNote *note) {
     zi_editor_free_bitmaps(app);
     app->photo_busy = 0;
     app->photo_failed = note->failed || !note->bitmap;
+    if (note->notice[0]) {
+        wcscpy_s(app->notice, 192, note->notice);
+    }
     if (app->photo_failed) {
         app->spectrum_ready = 0;
+        if (g_pdf_wait && !note->notice[0]) {
+            wcscpy_s(app->notice, 192, L"That PDF page could not be drawn on this PC.");
+        }
     }
     if (note->bitmap && !app->photo_failed) {
         app->photo_base = note->bitmap;
         note->bitmap = NULL;
         app->pending_fit = 1;
+        if (g_pdf_wait) {
+            app->pdf_picking = 0;
+        }
         zi_editor_rebuild(app);
     }
+    g_pdf_wait = 0;
     if (note->bitmap) {
         DeleteObject(note->bitmap);
     }
@@ -1790,6 +2426,9 @@ int zi_editor_can_paste(const ZiApp *app) {
 
 int zi_editor_can_rotate(const ZiApp *app) {
     if (!zi_showing_folder(app)) {
+        if (app->video_open || app->pdf_picking) {
+            return 0;
+        }
         return app->photo_path[0] && !app->photo_failed;
     }
     return zi_marked_still(app);
@@ -1797,7 +2436,10 @@ int zi_editor_can_rotate(const ZiApp *app) {
 
 int zi_editor_can_export(const ZiApp *app) {
     if (!zi_showing_folder(app)) {
-        return app->photo_path[0] && !app->photo_failed;
+        if (app->video_open) {
+            return 1;
+        }
+        return app->photo_path[0] && !app->photo_failed && !app->pdf_picking;
     }
     return zi_marked_still(app);
 }
@@ -1903,7 +2545,15 @@ void zi_editor_on_grade(ZiApp *app, ZiGradeNote *note) {
 }
 
 void zi_editor_set_slider(ZiApp *app, int index, double value) {
-    if (!app->photo_path[0] || app->photo_failed || index < 0 || index >= ZI_SLIDER_COUNT) {
+    if (!app || index < 0 || index >= ZI_SLIDER_COUNT) {
+        return;
+    }
+    if (app->video_open) {
+        zi_slider_set(&app->edit, index, value);
+        zi_editor_refresh(app);
+        return;
+    }
+    if (!app->photo_path[0] || app->photo_failed) {
         return;
     }
     zi_slider_set(&app->edit, index, value);
@@ -1915,10 +2565,25 @@ void zi_editor_set_slider(ZiApp *app, int index, double value) {
 void zi_editor_slider_commit(ZiApp *app) {
     const ZiSliderSpec *spec;
 
-    if (!app->photo_path[0] || app->hist_len < 1) {
+    if (!app || app->slider_index < 0 || app->slider_index >= ZI_SLIDER_COUNT) {
         return;
     }
-    if (app->slider_index < 0 || app->slider_index >= ZI_SLIDER_COUNT) {
+    if (app->video_open) {
+        if (app->photo_path[0] && app->hist_len >= 1 && app->hist_pos >= 0 && app->hist_pos < app->hist_len &&
+            !zi_tone_same(&app->edit, &app->hist[app->hist_pos].tone)) {
+            spec = zi_slider_spec(app->slider_index);
+            zi_edit_set(app->photo_path, &app->edit);
+            if (app->slider_index >= ZI_SL_CTL_X && app->slider_index <= ZI_SL_CBL_Y) {
+                zi_hist_push(app, &app->edit, L"Corners");
+            } else {
+                zi_hist_push(app, &app->edit, spec->label);
+            }
+        }
+        zi_media_on_grade(app);
+        zi_editor_refresh(app);
+        return;
+    }
+    if (!app->photo_path[0] || app->hist_len < 1) {
         return;
     }
     if (app->hist_pos < 0 || app->hist_pos >= app->hist_len) {
@@ -1940,7 +2605,10 @@ void zi_editor_slider_commit(ZiApp *app) {
 void zi_editor_slider_reset(ZiApp *app, int index) {
     const ZiSliderSpec *spec;
 
-    if (index < 0 || index >= ZI_SLIDER_COUNT || !app->photo_path[0] || app->photo_failed) {
+    if (!app || index < 0 || index >= ZI_SLIDER_COUNT) {
+        return;
+    }
+    if (!app->video_open && (!app->photo_path[0] || app->photo_failed)) {
         return;
     }
     spec = zi_slider_spec(index);
@@ -2239,16 +2907,35 @@ void zi_editor_paste_index(ZiApp *app, int index) {
     zi_editor_refresh(app);
 }
 
-static void zi_rotate_path(ZiApp *app, const wchar_t *path, int clockwise, int record) {
-    ZiTone next = zi_edit_get(path);
+static void zi_orient_path(ZiApp *app, const wchar_t *path, int turn_delta, int flip, int horizontal,
+                           int record, const wchar_t *label) {
+    ZiTone next;
+    int open;
 
-    next.turns = (next.turns + (clockwise ? 1 : 3)) & 3;
-    if (record && app->photo_path[0] && path && _wcsicmp(path, app->photo_path) == 0) {
-        zi_hist_push(app, &next, clockwise ? L"Rotate right" : L"Rotate left");
+    if (!path || !path[0] || !label) {
+        return;
+    }
+    open = app->photo_path[0] && _wcsicmp(path, app->photo_path) == 0;
+    next = open ? app->edit : zi_edit_get(path);
+    if (open) {
+        zi_touch_capture_orient(&g_live, next.turns, next.flip_h, next.flip_v);
+    }
+    if (flip) {
+        zi_tone_apply_flip(&next, horizontal);
+    } else {
+        zi_tone_apply_turn(&next, turn_delta);
+    }
+    if (record && open) {
+        zi_hist_push(app, &next, label);
     } else if (record) {
-        zi_queue_commit(path, &next, clockwise ? L"Rotate right" : L"Rotate left");
+        zi_queue_commit(path, &next, label);
     }
     zi_apply_edit(app, path, &next);
+}
+
+static void zi_rotate_path(ZiApp *app, const wchar_t *path, int clockwise, int record) {
+    zi_orient_path(app, path, clockwise ? 1 : 3, 0, 0, record,
+                   clockwise ? L"Rotate right" : L"Rotate left");
 }
 
 void zi_editor_rotate(ZiApp *app, int clockwise) {
@@ -2277,6 +2964,276 @@ void zi_editor_rotate(ZiApp *app, int clockwise) {
     zi_editor_refresh(app);
 }
 
+void zi_editor_flip(ZiApp *app, int horizontal) {
+    int i;
+    int any = 0;
+    const wchar_t *label = horizontal ? L"Flip left/right" : L"Flip top/bottom";
+
+    if (!zi_editor_can_rotate(app)) {
+        zi_editor_notice(app, L"Select a still.");
+        return;
+    }
+    if (!zi_showing_folder(app)) {
+        zi_orient_path(app, app->photo_path, 0, 1, horizontal, 1, label);
+        zi_editor_refresh(app);
+        return;
+    }
+    for (i = 0; i < app->file_count; i++) {
+        if (app->file_mark[i] && !app->files[i].video) {
+            zi_orient_path(app, app->files[i].path, 0, 1, horizontal, 1, label);
+            any = 1;
+        }
+    }
+    if (!any) {
+        zi_editor_notice(app, L"Select a still.");
+        return;
+    }
+    zi_editor_refresh(app);
+}
+
+void zi_editor_curve_preset(ZiApp *app, int preset) {
+    ZiTone next;
+
+    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed || !app->photo_path[0] ||
+        app->video_open || app->pdf_picking) {
+        return;
+    }
+    if (preset < 0 || preset > 4) {
+        return;
+    }
+    zi_editor_commit_open(app);
+    next = app->edit;
+    zi_curve_preset(&next.curves, preset);
+    if (zi_tone_same(&app->edit, &next)) {
+        zi_editor_refresh(app);
+        return;
+    }
+    zi_hist_push(app, &next, L"Curve");
+    zi_apply_edit(app, app->photo_path, &next);
+}
+
+void zi_editor_curve_channel(ZiApp *app, int channel) {
+    if (!app) {
+        return;
+    }
+    if (channel < 0) {
+        channel = 0;
+    }
+    if (channel > 3) {
+        channel = 3;
+    }
+    app->curve_channel = channel;
+    zi_editor_refresh(app);
+}
+
+void zi_editor_curve_apply(ZiApp *app, const ZiCurves *curves, int commit) {
+    static const wchar_t *const labels[4] = {
+        L"Curve", L"Red curve", L"Green curve", L"Blue curve"
+    };
+    ZiTone next;
+    int channel;
+
+    if (!app || zi_showing_folder(app) || app->pdf_picking) {
+        return;
+    }
+    if (!app->video_open && (!app->photo || app->photo_failed || !app->photo_path[0])) {
+        return;
+    }
+    next = app->edit;
+    if (curves) {
+        next.curves = *curves;
+        zi_curve_sanitize(&next.curves.master);
+        zi_curve_sanitize(&next.curves.red);
+        zi_curve_sanitize(&next.curves.green);
+        zi_curve_sanitize(&next.curves.blue);
+    }
+    channel = app->curve_channel;
+    if (channel < 0 || channel > 3) {
+        channel = 0;
+    }
+    if (!commit) {
+        app->edit = next;
+        if (app->video_open) {
+            zi_media_on_grade(app);
+        } else {
+            zi_editor_rebuild(app);
+        }
+        zi_editor_refresh(app);
+        return;
+    }
+    if (app->hist_len > 0 && app->hist_pos >= 0 && app->hist_pos < app->hist_len &&
+        zi_tone_same(&app->hist[app->hist_pos].tone, &next)) {
+        app->edit = next;
+        zi_editor_refresh(app);
+        return;
+    }
+    if (app->video_open) {
+        app->edit = next;
+        zi_hist_push(app, &next, labels[channel]);
+        zi_edit_set(app->photo_path, &next);
+        zi_media_on_grade(app);
+        zi_editor_refresh(app);
+        return;
+    }
+    zi_hist_push(app, &next, labels[channel]);
+    zi_apply_edit(app, app->photo_path, &next);
+}
+
+static int zi_photo_has_uid(ZiApp *app) {
+    ZiFile *file;
+
+    if (!app || !app->photo_path[0]) {
+        return 0;
+    }
+    file = zi_file_by_path(app, app->photo_path);
+    return file && file->uid[0] != '\0';
+}
+
+static int zi_flat_on_disk(const wchar_t *path) {
+    wchar_t dest[MAX_PATH];
+    DWORD attr;
+
+    dest[0] = L'\0';
+    if (!path || !path[0] || !zi_flatten_path(path, dest, MAX_PATH) || !dest[0]) {
+        return 0;
+    }
+    attr = GetFileAttributesW(dest);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static HBITMAP zi_flatten_source(ZiApp *app) {
+    HBITMAP rendered = NULL;
+
+    if (!app) {
+        return NULL;
+    }
+    if (app->photo_base) {
+        rendered = zi_tone_render(app->photo_base, &app->edit, &g_live, NULL, NULL, NULL);
+    }
+    if (!rendered && app->photo) {
+        rendered = zi_copy_turned(app->photo, 0);
+    }
+    return rendered;
+}
+
+static void zi_edits_identity(ZiApp *app) {
+    ZiTone bare;
+    int i;
+
+    zi_tone_identity(&bare);
+    zi_touch_doc_free(&g_live);
+    zi_touch_doc_clear(&g_live);
+    for (i = 0; i < ZI_HIST; i++) {
+        zi_touch_doc_free(&g_steps[i]);
+        zi_touch_doc_clear(&g_steps[i]);
+    }
+    app->hist[0].tone = bare;
+    wcscpy_s(app->hist[0].label, 40, L"Open");
+    app->hist_len = 1;
+    app->hist_pos = 0;
+    app->horizon_have = 0;
+    zi_clear_marquee(app);
+    zi_apply_edit(app, app->photo_path, &bare);
+}
+
+static int zi_flatten_write(ZiApp *app, int duplicate) {
+    HBITMAP dib;
+    wchar_t written[MAX_PATH];
+    int ok;
+
+    written[0] = L'\0';
+    dib = zi_flatten_source(app);
+    if (!dib) {
+        zi_editor_notice(app, L"This photograph could not be written.");
+        return 0;
+    }
+    app->flatten_busy = 1;
+    ok = zi_flatten_tiff(app->photo_path, dib, duplicate, written, MAX_PATH);
+    app->flatten_busy = 0;
+    DeleteObject(dib);
+    if (!ok) {
+        zi_editor_notice(app, L"This photograph could not be written.");
+        return 0;
+    }
+    if (duplicate) {
+        zi_editor_notice(app, L"Wrote a duplicate TIFF.");
+    } else {
+        zi_editor_notice(app, L"Wrote the flattened TIFF.");
+    }
+    (void)written;
+    return 1;
+}
+
+int zi_editor_can_flatten(const ZiApp *app) {
+    if (!app || zi_showing_folder(app)) {
+        return 0;
+    }
+    if (!app->photo || app->photo_failed || !app->photo_path[0]) {
+        return 0;
+    }
+    if (app->video_open || app->pdf_picking || app->flatten_busy || app->export_busy) {
+        return 0;
+    }
+    return 1;
+}
+
+void zi_editor_flatten(ZiApp *app) {
+    int answer;
+    int has_uid;
+    int again;
+    const wchar_t *text;
+
+    if (!zi_editor_can_flatten(app) || g_modal) {
+        return;
+    }
+    has_uid = zi_photo_has_uid(app);
+    again = has_uid && zi_flat_on_disk(app->photo_path);
+    if (!has_uid) {
+        text = L"This photograph has no library id.\n\nOK writes a duplicate TIFF and keeps these edits.\nCancel leaves the file alone.";
+        g_modal = 1;
+        answer = MessageBoxW(app->hwnd, text, L"ZImager", MB_OKCANCEL | MB_ICONWARNING);
+        g_modal = 0;
+        if (answer != IDOK || !zi_editor_can_flatten(app)) {
+            return;
+        }
+        zi_flatten_write(app, 1);
+        return;
+    }
+    if (again) {
+        text = L"Flatten this photograph again?\n\nYes continues and replaces the TIFF. The edit list returns to the start.\nNo reverts the flat file and clears the edits.\nCancel leaves both alone.";
+    } else {
+        text = L"Write this photograph as a TIFF beside the original?\n\nYes flattens into the TIFF and keeps these edits.\nNo writes a duplicate TIFF and keeps these edits.\nCancel leaves the file alone.";
+    }
+    g_modal = 1;
+    answer = MessageBoxW(app->hwnd, text, L"ZImager", MB_YESNOCANCEL | MB_ICONWARNING);
+    g_modal = 0;
+    if (answer == IDCANCEL || !zi_editor_can_flatten(app)) {
+        return;
+    }
+    if (again) {
+        if (answer == IDYES) {
+            if (zi_flatten_write(app, 0)) {
+                zi_editor_reset(app);
+            }
+            return;
+        }
+        if (answer == IDNO) {
+            if (!zi_revert_flat(app->photo_path)) {
+                zi_editor_notice(app, L"The flat photograph could not be restored.");
+                return;
+            }
+            zi_edits_identity(app);
+            zi_editor_notice(app, L"Reverted the flat photograph.");
+        }
+        return;
+    }
+    if (answer == IDYES) {
+        zi_flatten_write(app, 0);
+    } else if (answer == IDNO) {
+        zi_flatten_write(app, 1);
+    }
+}
+
 void zi_editor_unavailable(ZiApp *app, int id) {
     (void)app;
     (void)id;
@@ -2285,7 +3242,7 @@ void zi_editor_unavailable(ZiApp *app, int id) {
 static int zi_touch_size_px(const ZiApp *app) {
     int px = app ? app->touch_size : 48;
 
-    if (px < 8 || px > 400) {
+    if (px < 8 || px > 200) {
         return 48;
     }
     return px;
@@ -2346,6 +3303,8 @@ static DWORD WINAPI zi_touch_thread(LPVOID param) {
             found = zi_touch_scratch_mask(rgb, w, h, &mask);
         } else if (job->kind == 2) {
             found = zi_touch_spot_mask(rgb, w, h, job->x, job->y, job->radius, &mask);
+        } else if (job->kind == 5) {
+            found = zi_touch_redeye_mask(rgb, w, h, job->x, job->y, &mask);
         } else {
             found = zi_touch_stroke_mask(w, h, job->xs, job->ys, job->count, job->radius, &mask);
         }
@@ -2532,6 +3491,8 @@ static int zi_touch_begin(ZiApp *app, int kind, int x, int y, int radius, const 
         working = L"Removing dust\u2026";
     } else if (kind == 1) {
         working = L"Removing scratches\u2026";
+    } else if (kind == 5) {
+        working = L"Removing red eye\u2026";
     } else {
         working = L"Removing the scratch\u2026";
     }
@@ -2603,7 +3564,10 @@ void zi_editor_on_touch(ZiApp *app, ZiTouchNote *note) {
             g_spot_q_len = 0;
             zi_editor_notice(app, L"The repair list is full.");
         } else {
-            if (note->kind == 1 || note->kind == 3) {
+            if (note->kind == 5) {
+                model = ZI_TOUCH_REDEYE;
+                label = L"Red eye";
+            } else if (note->kind == 1 || note->kind == 3) {
                 model = ZI_TOUCH_SCRATCH;
                 label = L"Scratches";
             } else {
@@ -2631,6 +3595,8 @@ void zi_editor_on_touch(ZiApp *app, ZiTouchNote *note) {
             empty = L"No scratch stood out from the surrounding photo. Drag the Scratch circle along one.";
         } else if (note->kind == 2) {
             empty = L"No speck stood out in that circle. Cover the spot and click it.";
+        } else if (note->kind == 5) {
+            empty = L"No red eye stood out at that click.";
         } else {
             empty = L"No scratch stood out under that stroke.";
         }
@@ -2642,21 +3608,21 @@ void zi_editor_on_touch(ZiApp *app, ZiTouchNote *note) {
 }
 
 void zi_editor_touch_dust(ZiApp *app) {
-    if (!app || app->touch_busy || zi_showing_folder(app)) {
+    if (!app || app->touch_busy || zi_showing_folder(app) || app->video_open || app->pdf_picking) {
         return;
     }
     zi_touch_begin(app, 0, 0, 0, 0, NULL, NULL, 0);
 }
 
 void zi_editor_touch_scratches(ZiApp *app) {
-    if (!app || app->touch_busy || zi_showing_folder(app)) {
+    if (!app || app->touch_busy || zi_showing_folder(app) || app->video_open || app->pdf_picking) {
         return;
     }
     zi_touch_begin(app, 1, 0, 0, 0, NULL, NULL, 0);
 }
 
 void zi_editor_toggle_spot(ZiApp *app) {
-    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed) {
+    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed || app->video_open || app->pdf_picking) {
         return;
     }
     if (app->spot_tool) {
@@ -2667,6 +3633,7 @@ void zi_editor_toggle_spot(ZiApp *app) {
         app->spot_tool = 1;
         app->scratch_tool = 0;
         app->scratch_drag = 0;
+        app->redeye_tool = 0;
         app->zoom_tool = 0;
         app->select_tool = 0;
         app->eyedropper_tool = 0;
@@ -2678,7 +3645,7 @@ void zi_editor_toggle_spot(ZiApp *app) {
 }
 
 void zi_editor_toggle_scratch(ZiApp *app) {
-    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed) {
+    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed || app->video_open || app->pdf_picking) {
         return;
     }
     if (app->scratch_tool) {
@@ -2690,6 +3657,7 @@ void zi_editor_toggle_scratch(ZiApp *app) {
     } else {
         app->scratch_tool = 1;
         app->spot_tool = 0;
+        app->redeye_tool = 0;
         app->zoom_tool = 0;
         app->select_tool = 0;
         app->eyedropper_tool = 0;
@@ -2708,8 +3676,8 @@ void zi_editor_touch_size_set(ZiApp *app, int px, int commit) {
     if (px < 8) {
         px = 8;
     }
-    if (px > 400) {
-        px = 400;
+    if (px > 200) {
+        px = 200;
     }
     app->touch_size = px;
     zi_editor_refresh(app);
@@ -2780,17 +3748,75 @@ void zi_editor_touch_move(ZiApp *app, int x, int y) {
     zi_editor_refresh(app);
 }
 
+static int zi_stroke_reach(const ZiApp *app, int count) {
+    int i;
+    int min_x;
+    int max_x;
+    int min_y;
+    int max_y;
+    int dx;
+    int dy;
+
+    if (!app || count < 1) {
+        return 0;
+    }
+    min_x = app->scratch_x[0];
+    max_x = min_x;
+    min_y = app->scratch_y[0];
+    max_y = min_y;
+    for (i = 1; i < count; i++) {
+        if (app->scratch_x[i] < min_x) {
+            min_x = app->scratch_x[i];
+        }
+        if (app->scratch_x[i] > max_x) {
+            max_x = app->scratch_x[i];
+        }
+        if (app->scratch_y[i] < min_y) {
+            min_y = app->scratch_y[i];
+        }
+        if (app->scratch_y[i] > max_y) {
+            max_y = app->scratch_y[i];
+        }
+    }
+    dx = max_x - min_x;
+    dy = max_y - min_y;
+    return dx > dy ? dx : dy;
+}
+
+static void zi_spot_at(ZiApp *app, int px, int py) {
+    int radius = zi_brush_radius(app);
+
+    if (g_touch_inflight || g_spot_q_len > 0) {
+        if (zi_spot_enqueue(app, px, py, radius) && !g_touch_inflight) {
+            zi_spot_pump(app);
+        }
+        return;
+    }
+    zi_touch_begin(app, 2, px, py, radius, NULL, NULL, 0);
+}
+
 void zi_editor_scratch_finish(ZiApp *app) {
     int count;
     int radius;
+    int reach;
 
     if (!app || !app->scratch_drag) {
         return;
     }
     app->scratch_drag = 0;
     count = app->scratch_count;
-    if (count < 2) {
+    reach = zi_stroke_reach(app, count);
+    if (count < 1) {
         app->scratch_count = 0;
+        zi_editor_refresh(app);
+        return;
+    }
+    if (count < 2 || reach <= 3) {
+        int px = app->scratch_x[0];
+        int py = app->scratch_y[0];
+
+        app->scratch_count = 0;
+        zi_spot_at(app, px, py);
         zi_editor_refresh(app);
         return;
     }
@@ -3207,7 +4233,7 @@ static void zi_crop_begin(ZiApp *app, int x, int y) {
 }
 
 int zi_editor_can_crop(const ZiApp *app) {
-    if (zi_showing_folder(app) || !app->has_marquee || !app->photo) {
+    if (!app || zi_showing_folder(app) || app->video_open || app->pdf_picking || !app->has_marquee || !app->photo) {
         return 0;
     }
     return zi_norm_usable(app->marquee_w, app->marquee_h, app->photo_w, app->photo_h);
@@ -3223,13 +4249,14 @@ void zi_editor_use_zoom(ZiApp *app) {
     app->scratch_tool = 0;
     app->scratch_drag = 0;
     app->scratch_count = 0;
+    app->redeye_tool = 0;
     app->hover_on = 0;
     zi_clear_marquee(app);
     zi_editor_refresh(app);
 }
 
 void zi_editor_toggle_select(ZiApp *app) {
-    if (zi_showing_folder(app) || !app->photo) {
+    if (zi_showing_folder(app) || !app->photo || app->video_open || app->pdf_picking) {
         return;
     }
     if (app->select_tool) {
@@ -3244,6 +4271,7 @@ void zi_editor_toggle_select(ZiApp *app) {
     app->spot_tool = 0;
     app->scratch_tool = 0;
     app->scratch_drag = 0;
+    app->redeye_tool = 0;
     app->hover_on = 0;
     app->has_marquee = 1;
     app->marquee_x = 0;
@@ -3254,7 +4282,7 @@ void zi_editor_toggle_select(ZiApp *app) {
 }
 
 void zi_editor_toggle_eyedropper(ZiApp *app) {
-    if (zi_showing_folder(app) || !app->photo || app->photo_failed) {
+    if (zi_showing_folder(app) || !app->photo || app->photo_failed || app->video_open || app->pdf_picking) {
         return;
     }
     if (app->eyedropper_tool) {
@@ -3269,13 +4297,14 @@ void zi_editor_toggle_eyedropper(ZiApp *app) {
     app->spot_tool = 0;
     app->scratch_tool = 0;
     app->scratch_drag = 0;
+    app->redeye_tool = 0;
     app->hover_on = 0;
     zi_clear_marquee(app);
     zi_editor_refresh(app);
 }
 
 void zi_editor_toggle_horizon(ZiApp *app) {
-    if (zi_showing_folder(app) || !app->photo || app->photo_failed) {
+    if (zi_showing_folder(app) || !app->photo || app->photo_failed || app->video_open || app->pdf_picking) {
         return;
     }
     if (app->horizon_tool) {
@@ -3290,6 +4319,30 @@ void zi_editor_toggle_horizon(ZiApp *app) {
     app->spot_tool = 0;
     app->scratch_tool = 0;
     app->scratch_drag = 0;
+    app->redeye_tool = 0;
+    app->hover_on = 0;
+    zi_clear_marquee(app);
+    zi_editor_refresh(app);
+}
+
+void zi_editor_redeye_toggle(ZiApp *app) {
+    if (!app || zi_showing_folder(app) || !app->photo || app->photo_failed || app->video_open || app->pdf_picking) {
+        return;
+    }
+    if (app->redeye_tool) {
+        zi_editor_use_zoom(app);
+        return;
+    }
+    app->redeye_tool = 1;
+    app->spot_tool = 0;
+    app->scratch_tool = 0;
+    app->scratch_drag = 0;
+    app->scratch_count = 0;
+    app->eyedropper_tool = 0;
+    app->horizon_tool = 0;
+    app->horizon_have = 0;
+    app->select_tool = 0;
+    app->zoom_tool = 0;
     app->hover_on = 0;
     zi_clear_marquee(app);
     zi_editor_refresh(app);
@@ -3298,7 +4351,7 @@ void zi_editor_toggle_horizon(ZiApp *app) {
 void zi_editor_set_corner_pin(ZiApp *app, int enabled) {
     ZiTone next;
 
-    if (!app->photo_path[0] || app->photo_failed) {
+    if (!app->photo_path[0] || app->photo_failed || app->video_open || app->pdf_picking) {
         return;
     }
     zi_editor_commit_open(app);
@@ -3331,7 +4384,8 @@ void zi_editor_set_corner_pin(ZiApp *app, int enabled) {
 void zi_editor_choose_lens(ZiApp *app, int index) {
     ZiTone next;
 
-    if (!app->photo_path[0] || app->photo_failed || index < 0 || index >= zi_lens_count()) {
+    if (!app->photo_path[0] || app->photo_failed || app->video_open || app->pdf_picking ||
+        index < 0 || index >= zi_lens_count()) {
         return;
     }
     zi_editor_commit_open(app);
@@ -3387,7 +4441,7 @@ HCURSOR zi_editor_cursor(const ZiApp *app, int x, int y) {
     if (zi_showing_folder(app) || !app->photo || !PtInRect(&app->regions.canvas, pt)) {
         return NULL;
     }
-    if (app->eyedropper_tool || app->horizon_tool || app->spot_tool || app->scratch_tool) {
+    if (app->eyedropper_tool || app->horizon_tool || app->spot_tool || app->scratch_tool || app->redeye_tool) {
         return LoadCursor(NULL, IDC_CROSS);
     }
     if (!app->select_tool) {
@@ -3545,11 +4599,13 @@ static void zi_horizon_click(ZiApp *app, int x, int y) {
     double vy;
     double sx;
     double sy;
+    double pw;
+    double ph;
     ZiTone next;
     int quarter = 0;
     double degrees = 0;
 
-    if (!app->photo || app->photo_failed || !app->photo_path[0]) {
+    if (!app->photo || app->photo_failed || !app->photo_path[0] || app->video_open || app->pdf_picking) {
         return;
     }
     if (!zi_horizon_view(app, x, y, &vx, &vy)) {
@@ -3566,15 +4622,24 @@ static void zi_horizon_click(ZiApp *app, int x, int y) {
         return;
     }
     next = app->edit;
-    zi_horizon_delta(app->horizon_sx, app->horizon_sy, sx, sy, &quarter, &degrees);
-    app->horizon_have = 0;
-    next.turns = (next.turns + quarter + 4) & 3;
-    next.straighten += degrees;
-    if (next.straighten > 45) {
-        next.straighten = 45;
+    pw = (double)app->photo_w;
+    ph = (double)app->photo_h;
+    if (next.has_crop && next.crop_w > 0.0 && next.crop_h > 0.0) {
+        pw = (double)app->photo_w / next.crop_w;
+        ph = (double)app->photo_h / next.crop_h;
     }
-    if (next.straighten < -45) {
-        next.straighten = -45;
+    zi_horizon_delta(app->horizon_sx, app->horizon_sy, sx, sy, pw, ph, &quarter, &degrees);
+    app->horizon_have = 0;
+    if (quarter != 0) {
+        zi_touch_capture_orient(&g_live, next.turns, next.flip_h, next.flip_v);
+        zi_tone_apply_turn(&next, quarter);
+    }
+    next.straighten += degrees;
+    if (next.straighten > 45.0) {
+        next.straighten = 45.0;
+    }
+    if (next.straighten < -45.0) {
+        next.straighten = -45.0;
     }
     if (zi_tone_same(&app->edit, &next)) {
         zi_editor_refresh(app);
@@ -3587,83 +4652,92 @@ static void zi_horizon_click(ZiApp *app, int x, int y) {
 
 int zi_editor_mouse_down(ZiApp *app, int x, int y, int right) {
     POINT pt;
+    int armed;
+    int px = 0;
+    int py = 0;
 
     pt.x = x;
     pt.y = y;
     if (zi_showing_folder(app) || !PtInRect(&app->regions.canvas, pt)) {
         return 0;
     }
-    if (!app->photo) {
+    if (app->pdf_picking) {
+        int index = zi_pdf_index_at(app, x, y);
+
+        if (!right && index >= 0) {
+            zi_pdf_open_index(app, index);
+        }
         return 1;
     }
-    if (app->select_tool) {
+    if (!app->photo && !app->video_open) {
+        return 1;
+    }
+    if (!app->video_open && app->select_tool) {
         if (!right) {
             zi_crop_begin(app, x, y);
         }
         return 1;
     }
-    if (app->eyedropper_tool && !app->space_down) {
+    if (!app->video_open && app->eyedropper_tool && !app->space_down) {
         if (!right) {
             zi_drop_begin(app, x, y);
         }
         return 1;
     }
-    if (app->horizon_tool && !app->space_down) {
+    if (!app->video_open && app->horizon_tool && !app->space_down) {
         if (!right) {
             zi_horizon_click(app, x, y);
         }
         return 1;
     }
-    if ((app->spot_tool || app->scratch_tool) && !app->space_down) {
-        int px = 0;
-        int py = 0;
-
+    if (!app->video_open && (app->spot_tool || app->scratch_tool) && !app->space_down) {
         if (right) {
             return 1;
         }
-        if (app->scratch_tool) {
-            app->scratch_drag = 1;
-            app->scratch_count = 0;
-            if (zi_view_point(app, x, y, &px, &py)) {
-                app->scratch_x[0] = px;
-                app->scratch_y[0] = py;
-                app->scratch_count = 1;
-                app->hover_on = 1;
-                app->hover_x = x;
-                app->hover_y = y;
-            }
-            if (app->hwnd) {
-                SetCapture(app->hwnd);
-            }
-            return 1;
-        }
+        app->scratch_drag = 1;
+        app->scratch_count = 0;
         if (zi_view_point(app, x, y, &px, &py)) {
-            int radius = zi_brush_radius(app);
-
-            if (g_touch_inflight || g_spot_q_len > 0) {
-                if (zi_spot_enqueue(app, px, py, radius) && !g_touch_inflight) {
-                    zi_spot_pump(app);
-                }
-            } else {
-                zi_touch_begin(app, 2, px, py, radius, NULL, NULL, 0);
-            }
+            app->scratch_x[0] = px;
+            app->scratch_y[0] = py;
+            app->scratch_count = 1;
+            app->hover_on = 1;
+            app->hover_x = x;
+            app->hover_y = y;
+        }
+        if (app->hwnd) {
+            SetCapture(app->hwnd);
         }
         return 1;
     }
-    if (app->space_down && !right) {
+    if (!app->video_open && app->redeye_tool && !app->space_down) {
+        if (right) {
+            return 1;
+        }
+        if (zi_view_point(app, x, y, &px, &py)) {
+            zi_touch_begin(app, 5, px, py, 0, NULL, NULL, 0);
+        }
+        return 1;
+    }
+    armed = !app->video_open && (app->select_tool || app->eyedropper_tool || app->horizon_tool ||
+                                 app->spot_tool || app->scratch_tool || app->redeye_tool);
+    if (!right && (app->space_down || !armed)) {
         app->drag_pan = 1;
         app->drag_pt.x = x;
         app->drag_pt.y = y;
         app->drag_off_x = app->zoom_off_x;
         app->drag_off_y = app->zoom_off_y;
-        SetCapture(app->hwnd);
+        if (app->hwnd) {
+            SetCapture(app->hwnd);
+        }
         return 1;
     }
-    if (app->eyedropper_tool) {
+    if (armed) {
         return 1;
     }
-    zi_zoom_by(app, right ? (1.0 / ZI_SQRT2) : ZI_SQRT2, x, y);
-    zi_editor_refresh(app);
+    if (right) {
+        zi_zoom_by(app, 1.0 / ZI_SQRT2, x, y);
+        zi_editor_refresh(app);
+    }
     return 1;
 }
 
@@ -4005,7 +5079,7 @@ static void zi_paint_scratch_swath(ZiApp *app, HDC hdc, const RECT *canvas, cons
     int bw;
     int bh;
 
-    if (!app->scratch_tool || !app->scratch_drag || app->scratch_count < 2) {
+    if (!app->scratch_drag || app->scratch_count < 2) {
         return;
     }
     if (app->photo_w < 1 || app->photo_h < 1) {
@@ -4167,7 +5241,28 @@ int zi_editor_paint(ZiApp *app, HDC hdc) {
     HDC mem;
     HGDIOBJ old;
 
-    if (zi_showing_folder(app) || !app->photo_path[0]) {
+    if (zi_showing_folder(app)) {
+        return 0;
+    }
+    if (app->video_open) {
+        canvas = app->regions.canvas;
+        zi_media_paint(app, hdc);
+        if (app->notice[0]) {
+            RECT bar = canvas;
+            RECT label;
+
+            bar.bottom = bar.top + zi_px(app, 28);
+            FillRect(hdc, &bar, app->panel);
+            label = bar;
+            InflateRect(&label, -zi_px(app, 12), 0);
+            SetTextColor(hdc, ZI_INK);
+            SelectObject(hdc, app->font);
+            DrawTextW(hdc, app->notice, -1, &label,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        return 1;
+    }
+    if (!app->photo_path[0]) {
         return 0;
     }
     canvas = app->regions.canvas;
@@ -4249,9 +5344,11 @@ int zi_editor_paint(ZiApp *app, HDC hdc) {
             }
         }
         RestoreDC(hdc, saved);
+    } else if (app->pdf_picking && g_pdf_count > 0) {
+        zi_paint_pdf_pages(app, hdc);
     } else {
         const wchar_t *message = app->photo_failed
-            ? L"This photograph could not be opened."
+            ? (app->notice[0] ? app->notice : L"This photograph could not be opened.")
             : L"Opening this photograph.";
         RECT message_rc = canvas;
 
@@ -5077,6 +6174,53 @@ static int zi_count_targets(const ZiApp *app) {
     return n;
 }
 
+static int zi_pick_mpeg4(ZiApp *app, wchar_t *dest, size_t cap, const wchar_t *name) {
+    IFileSaveDialog *dlg = NULL;
+    IShellItem *item = NULL;
+    PWSTR path = NULL;
+    DWORD options = 0;
+    HRESULT hr;
+    int ok = 0;
+    static const COMDLG_FILTERSPEC k_mpeg = { L"MPEG-4", L"*.mp4" };
+
+    if (!app || !dest || cap < 2) {
+        return 0;
+    }
+    dest[0] = L'\0';
+    hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void **)&dlg);
+    if (FAILED(hr) || !dlg) {
+        return 0;
+    }
+    dlg->lpVtbl->GetOptions(dlg, &options);
+    dlg->lpVtbl->SetOptions(dlg, options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST);
+    dlg->lpVtbl->SetTitle(dlg, L"Export");
+    dlg->lpVtbl->SetFileTypes(dlg, 1, &k_mpeg);
+    dlg->lpVtbl->SetDefaultExtension(dlg, L"mp4");
+    if (name && name[0]) {
+        dlg->lpVtbl->SetFileName(dlg, name);
+    }
+    hr = dlg->lpVtbl->Show(dlg, app->hwnd);
+    if (SUCCEEDED(hr)) {
+        hr = dlg->lpVtbl->GetResult(dlg, &item);
+    }
+    if (SUCCEEDED(hr) && item) {
+        hr = item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &path);
+    }
+    if (SUCCEEDED(hr) && path && wcslen(path) < cap) {
+        wcscpy_s(dest, cap, path);
+        zi_force_ext(dest, cap, L"mp4");
+        ok = 1;
+    }
+    if (path) {
+        CoTaskMemFree(path);
+    }
+    if (item) {
+        item->lpVtbl->Release(item);
+    }
+    dlg->lpVtbl->Release(dlg);
+    return ok;
+}
+
 void zi_editor_export(ZiApp *app) {
     IWICImagingFactory *factory = NULL;
     wchar_t dest[MAX_PATH];
@@ -5089,6 +6233,37 @@ void zi_editor_export(ZiApp *app) {
     int i;
     wchar_t message[128];
 
+    if (app && !zi_showing_folder(app) && app->video_open) {
+        wchar_t before[192];
+        int ok;
+
+        if (!app->photo_path[0]) {
+            zi_editor_notice(app, L"That video could not be exported.");
+            return;
+        }
+        zi_stem(app->photo_path, suggested, ZI_NAME);
+        wcscat_s(suggested, ZI_NAME, L" exported.mp4");
+        if (!zi_pick_mpeg4(app, dest, MAX_PATH, suggested)) {
+            return;
+        }
+        if (_wcsicmp(dest, app->photo_path) == 0) {
+            zi_editor_notice(app, L"Export writes a new file. Choose a different name.");
+            return;
+        }
+        before[0] = L'\0';
+        if (app->notice[0]) {
+            wcscpy_s(before, 192, app->notice);
+        }
+        app->export_busy = 1;
+        ok = zi_media_export(app, dest);
+        app->export_busy = 0;
+        if (ok) {
+            zi_editor_notice(app, L"Exported 1 video.");
+        } else if (!app->notice[0] || wcscmp(app->notice, before) == 0) {
+            zi_editor_notice(app, L"That video could not be exported.");
+        }
+        return;
+    }
     count = zi_count_targets(app);
     if (count < 1) {
         zi_editor_notice(app, L"Select a still.");
@@ -5119,6 +6294,7 @@ void zi_editor_export(ZiApp *app) {
             zi_editor_notice(app, L"Export writes a new file. Choose a different name.");
             return;
         }
+        app->export_busy = 1;
         previous = SetCursor(LoadCursor(NULL, IDC_WAIT));
         CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&factory);
         if (!zi_format_ready(factory, format)) {
@@ -5126,6 +6302,7 @@ void zi_editor_export(ZiApp *app) {
             if (factory) {
                 factory->lpVtbl->Release(factory);
             }
+            app->export_busy = 0;
             SetCursor(previous);
             zi_editor_notice(app, message);
             return;
@@ -5140,6 +6317,7 @@ void zi_editor_export(ZiApp *app) {
         if (factory) {
             factory->lpVtbl->Release(factory);
         }
+        app->export_busy = 0;
         SetCursor(previous);
     } else {
         if (!zi_pick_format(app)) {
@@ -5161,6 +6339,7 @@ void zi_editor_export(ZiApp *app) {
         if (!zi_pick_folder(app, folder, MAX_PATH)) {
             return;
         }
+        app->export_busy = 1;
         previous = SetCursor(LoadCursor(NULL, IDC_WAIT));
         CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&factory);
         for (i = 0; factory && i < app->file_count; i++) {
@@ -5183,6 +6362,7 @@ void zi_editor_export(ZiApp *app) {
         if (factory) {
             factory->lpVtbl->Release(factory);
         }
+        app->export_busy = 0;
         SetCursor(previous);
     }
     if (exported > 0 && failed == 0) {
@@ -5991,6 +7171,10 @@ void zi_editor_shutdown(ZiApp *app) {
     if (app && g_hold) {
         zi_edits_note(app);
     }
+    if (app) {
+        zi_media_close(app);
+    }
+    zi_pdf_release();
     if (g_work_started && g_work_idle) {
         WaitForSingleObject(g_work_idle, 600000);
     }

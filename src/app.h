@@ -5,12 +5,21 @@
 #include <windows.h>
 
 #include "palette.h"
+#include "features.h"
 
 #define ZI_MAX_FOLDERS 400
-#define ZI_MAX_FILES   200
+#define ZI_MAX_FILES   500
 #define ZI_NAME        260
 #define ZI_CTRL_CAP    320
-#define ZI_SECTIONS    6
+#define ZI_SECTIONS    8
+#define ZI_SEC_SPECTRUM 0
+#define ZI_SEC_TONE 1
+#define ZI_SEC_CURVE 2
+#define ZI_SEC_COLOR 3
+#define ZI_SEC_GEOMETRY 4
+#define ZI_SEC_TOUCHUP 5
+#define ZI_SEC_VIGNETTE 6
+#define ZI_SEC_HISTORY 7
 
 enum {
     ZI_ID_NONE = 0,
@@ -67,7 +76,43 @@ enum {
     ZI_ID_TOUCH_SIZE,
     ZI_ID_DUST_AMOUNT,
     ZI_ID_SCRATCH_AMOUNT,
-    ZI_ID_TOUCH_HINT
+    ZI_ID_TOUCH_HINT,
+    ZI_ID_FLATTEN,
+    ZI_ID_REDEYE,
+    ZI_ID_CURVE_GRAPH,
+    ZI_ID_CURVE_RGB,
+    ZI_ID_CURVE_RED,
+    ZI_ID_CURVE_GREEN,
+    ZI_ID_CURVE_BLUE,
+    ZI_ID_CURVE_LINEAR,
+    ZI_ID_CURVE_MATTE,
+    ZI_ID_CURVE_MOODY,
+    ZI_ID_CURVE_PUNCH,
+    ZI_ID_CURVE_LOFI,
+    ZI_ID_FIND,
+    ZI_ID_CLEAR_FILTER,
+    ZI_ID_PAGE_FIRST,
+    ZI_ID_PAGE_PREV,
+    ZI_ID_PAGE_NEXT,
+    ZI_ID_PAGE_LAST,
+    ZI_ID_MOVE_GO,
+    ZI_ID_MOVE_SUB,
+    ZI_ID_MERGE_H,
+    ZI_ID_MERGE_V,
+    ZI_ID_MERGE_OK,
+    ZI_ID_MERGE_CANCEL,
+    ZI_ID_ORGANIZE,
+    ZI_ID_CLEAN_DATE,
+    ZI_ID_RESCAN,
+    ZI_ID_BUILD_PREV,
+    ZI_ID_DELETE_ALL,
+    ZI_ID_FOLD_DATE,
+    ZI_ID_FOLD_MOVE,
+    ZI_ID_FOLD_MERGE,
+    ZI_ID_FOLD_BUILD,
+    ZI_ID_MOVE_NAME,
+    ZI_ID_MERGE_FIT,
+    ZI_ID_MERGE_FULL
 };
 
 enum {
@@ -88,6 +133,10 @@ enum {
     ZI_CMD_REDO,
     ZI_CMD_COPY,
     ZI_CMD_PASTE,
+    ZI_CMD_ROT_LEFT,
+    ZI_CMD_ROT_RIGHT,
+    ZI_CMD_FLIP_H,
+    ZI_CMD_FLIP_V,
     ZI_CMD_CTX_EDIT = 2101,
     ZI_CMD_CTX_REVEAL,
     ZI_CMD_CTX_OPEN,
@@ -95,6 +144,8 @@ enum {
     ZI_CMD_CTX_PASTE,
     ZI_CMD_CTX_SIZE,
     ZI_CMD_CTX_REMOVE,
+    ZI_CMD_CTX_RENAME,
+    ZI_CMD_CTX_PLAY,
     ZI_CMD_CTX_APP0 = 2200
 };
 
@@ -182,6 +233,19 @@ typedef struct ZiTone {
     int skin_preset;
     double skin_delta_a;
     double skin_delta_b;
+    /* 1.8.x grade. Missing .zimg keys stay at identity. */
+    double details;
+    double offset_x;
+    double offset_y;
+    int flip_h;
+    int flip_v;
+    double vignette_amount;
+    double vignette_mid;
+    double vignette_round;
+    double vignette_feather;
+    double vignette_x;
+    double vignette_y;
+    ZiCurves curves;
 } ZiTone;
 
 typedef struct ZiHistStep {
@@ -352,6 +416,7 @@ typedef struct ZiApp {
     int touch_size;
     int spot_tool;
     int scratch_tool;
+    int redeye_tool;
     int touch_busy;
     int scratch_drag;
     int scratch_count;
@@ -371,6 +436,31 @@ typedef struct ZiApp {
     int dup_busy;
     int event_selected;
     wchar_t grid_note[320];
+
+    /* 1.8.x folder, curve, video, and flatten state. Zero means off or the first page. */
+    int curve_channel;
+    wchar_t name_filter[ZI_NAME];
+    int file_page;
+    int file_still_total;
+    int file_match_total;
+    int file_video_total;
+    int file_filtered;
+    int fold_date;
+    int fold_move;
+    int fold_merge;
+    int fold_build;
+    int flatten_busy;
+    int export_busy;
+    int video_open;
+    int pdf_picking;
+    int merge_open;
+    int merge_vertical;
+    int merge_shift_x;
+    int merge_shift_y;
+    int merge_a;
+    int merge_b;
+    wchar_t move_name[ZI_NAME];
+    int move_sub;
 } ZiApp;
 
 static inline int zi_px(const ZiApp *app, int dip) {

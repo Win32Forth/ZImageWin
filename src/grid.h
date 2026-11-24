@@ -44,5 +44,13 @@ int zi_grid_preview_hit(ZiApp *app, int x, int y);
 void zi_grid_preview_drag(ZiApp *app, int x);
 int zi_grid_index_at(ZiApp *app, int x, int y);
 void zi_grid_select_only(ZiApp *app, int index);
+/* Case-insensitive file-name filter. Empty shows the folder. Resets to the first page. */
+void zi_grid_set_filter(ZiApp *app, const wchar_t *filter);
+void zi_grid_set_page(ZiApp *app, int page);
+int zi_grid_still_total(const ZiApp *app);
+int zi_grid_page_count(const ZiApp *app);
+int zi_grid_video_total(const ZiApp *app);
+/* Disk cache for the open folder. Does not call the helper. */
+void zi_grid_build_previews(ZiApp *app);
 
 #endif

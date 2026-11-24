@@ -18,6 +18,7 @@ typedef struct ZiPhotoNote {
     int w;
     int h;
     HBITMAP bitmap;
+    wchar_t notice[192];
 } ZiPhotoNote;
 
 typedef struct ZiFactNote {
@@ -142,6 +143,14 @@ void zi_editor_copy_path(ZiApp *app, const wchar_t *path);
 void zi_editor_paste(ZiApp *app);
 void zi_editor_paste_index(ZiApp *app, int index);
 void zi_editor_rotate(ZiApp *app, int clockwise);
+void zi_editor_flip(ZiApp *app, int horizontal);
+void zi_editor_curve_preset(ZiApp *app, int preset);
+void zi_editor_curve_channel(ZiApp *app, int channel);
+/* curves NULL keeps the open curve. commit 0 shows it. commit 1 records one history step. */
+void zi_editor_curve_apply(ZiApp *app, const ZiCurves *curves, int commit);
+void zi_editor_redeye_toggle(ZiApp *app);
+void zi_editor_flatten(ZiApp *app);
+int zi_editor_can_flatten(const ZiApp *app);
 void zi_editor_export(ZiApp *app);
 void zi_editor_save(ZiApp *app);
 void zi_editor_save_as(ZiApp *app);

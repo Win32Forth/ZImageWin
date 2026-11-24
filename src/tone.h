@@ -19,17 +19,26 @@ enum {
     ZI_SL_SHADOWS,
     ZI_SL_WHITES,
     ZI_SL_BLACKS,
-    ZI_SL_TEXTURE,
-    ZI_SL_CLARITY,
     ZI_SL_DEHAZE,
     ZI_SL_VIBRANCE,
     ZI_SL_SATURATION,
+    ZI_SL_TEXTURE,
+    ZI_SL_CLARITY,
+    ZI_SL_DETAILS,
+    ZI_SL_SHARPNESS,
     ZI_SL_TEMPERATURE,
     ZI_SL_TINT,
     ZI_SL_STRAIGHTEN,
     ZI_SL_VERTICAL,
     ZI_SL_HORIZONTAL,
-    ZI_SL_SHARPNESS,
+    ZI_SL_OFFSET_X,
+    ZI_SL_OFFSET_Y,
+    ZI_SL_VIG_AMOUNT,
+    ZI_SL_VIG_MID,
+    ZI_SL_VIG_ROUND,
+    ZI_SL_VIG_FEATHER,
+    ZI_SL_VIG_X,
+    ZI_SL_VIG_Y,
     ZI_SL_K1,
     ZI_SL_K2,
     ZI_SL_CTL_X,
@@ -68,7 +77,7 @@ void zi_slider_format(const ZiTone *tone, int index, wchar_t *dest, size_t cap);
 void zi_slider_geometry(const ZiApp *app, const RECT *row, RECT *label, RECT *track, RECT *value);
 int zi_section_body_dip(const ZiApp *app, int section);
 
-/* Lens, perspective, quarter-turns, straighten, sharpness, crop, then the tone stack.
+/* Lens, corner pins, quarter-turns, flips, keystone, straighten, offset, sharpness, crop, repairs, then tone.
    bins, when set, receives the display-luminance counts before the Spectrum handles. */
 #define ZI_GEO_TOP 4
 #define ZI_GEO_ROW 28
@@ -80,13 +89,20 @@ int zi_section_body_dip(const ZiApp *app, int section);
 #define ZI_LENS_COUNT 5
 
 int zi_geometry_body_dip(const ZiApp *app);
+int zi_curve_body_dip(const ZiApp *app);
 int zi_lens_count(void);
 const wchar_t *zi_lens_label(int index);
 const char *zi_lens_profile_id(int index);
 int zi_lens_profile_index(const char *profile_id);
 void zi_lens_copy(ZiTone *tone, int index);
-/* Quarter-turn delta, clockwise positive, and the straighten delta in degrees. */
-void zi_horizon_delta(double x0, double y0, double x1, double y1, int *quarter_turns, double *degrees);
+/* Normalized clicks, scaled by the on-screen pixel width and height before atan2. */
+void zi_horizon_delta(double x0, double y0, double x1, double y1,
+                      double pixel_width, double pixel_height,
+                      int *quarter_turns, double *degrees);
+/* Quarter-turn. An odd delta swaps the flip flags and the crop follows. */
+void zi_tone_apply_turn(ZiTone *tone, int delta);
+/* Mirror one pair of edges. The crop follows. horizontal is left/right. */
+void zi_tone_apply_flip(ZiTone *tone, int horizontal);
 /* Touch repair runs after the crop and before the tone stack. NULL skips it. */
 HBITMAP zi_tone_render(HBITMAP base, const ZiTone *tone, const ZiTouchDoc *touch, int *out_w, int *out_h, int *bins);
 /* Stops after that repair. The caller frees the RGB buffer. */

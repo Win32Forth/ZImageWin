@@ -3,8 +3,10 @@
 #include "chrome.h"
 #include "grid.h"
 #include "editor.h"
+#include "folders.h"
 #include "helper.h"
 #include "library.h"
+#include "media.h"
 #include "tone.h"
 
 #include <winnetwk.h>
@@ -129,6 +131,114 @@ static void zi_set_title(ZiApp *app) {
 static void zi_notice(ZiApp *app, const wchar_t *text) {
     wcscpy_s(app->notice, sizeof app->notice / sizeof app->notice[0], text);
     zi_redraw(app);
+}
+
+static int g_modal;
+static wchar_t g_name_buf[ZI_NAME];
+static int g_name_ok;
+static HWND g_name_edit;
+
+static LRESULT CALLBACK zi_name_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW *created = (CREATESTRUCTW *)lparam;
+
+        g_name_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", (LPCWSTR)created->lpCreateParams,
+                                       WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                       12, 12, 320, 24, hwnd, (HMENU)100, created->hInstance, NULL);
+        CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                        172, 48, 72, 26, hwnd, (HMENU)IDOK, created->hInstance, NULL);
+        CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE,
+                        252, 48, 80, 26, hwnd, (HMENU)IDCANCEL, created->hInstance, NULL);
+        if (g_name_edit) {
+            SendMessageW(g_name_edit, EM_SETSEL, 0, -1);
+            SetFocus(g_name_edit);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wparam) == IDOK) {
+            if (g_name_edit) {
+                GetWindowTextW(g_name_edit, g_name_buf, ZI_NAME);
+            }
+            g_name_ok = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wparam) == IDCANCEL) {
+            g_name_ok = 0;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        g_name_ok = 0;
+        DestroyWindow(hwnd);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static int zi_ask_name(HWND owner, const wchar_t *title, wchar_t *text, size_t cap) {
+    MSG msg;
+    HWND dlg;
+    RECT rc;
+    int saved = g_modal;
+
+    if (!text || cap < 2) {
+        return 0;
+    }
+    wcscpy_s(g_name_buf, ZI_NAME, text);
+    g_name_ok = 0;
+    GetWindowRect(owner, &rc);
+    g_modal = 1;
+    EnableWindow(owner, FALSE);
+    dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ZImagerName", title,
+                           WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                           rc.left + 120, rc.top + 140, 360, 130,
+                           owner, NULL, GetModuleHandleW(NULL), g_name_buf);
+    if (!dlg) {
+        EnableWindow(owner, TRUE);
+        g_modal = saved;
+        return 0;
+    }
+    ShowWindow(dlg, SW_SHOWNORMAL);
+    UpdateWindow(dlg);
+    while (IsWindow(dlg)) {
+        int got = GetMessageW(&msg, NULL, 0, 0);
+
+        if (got == 0) {
+            PostQuitMessage(0);
+            break;
+        }
+        if (got < 0) {
+            break;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    g_modal = saved;
+    if (!g_name_ok) {
+        return 0;
+    }
+    wcscpy_s(text, cap, g_name_buf);
+    return 1;
+}
+
+static int zi_ask(ZiApp *app, const wchar_t *text, UINT type) {
+    int answer;
+    int saved = g_modal;
+
+    g_modal = 1;
+    answer = MessageBoxW(app && app->hwnd ? app->hwnd : NULL, text, L"ZImager", type);
+    g_modal = saved;
+    return answer;
 }
 
 static int zi_name_less(const void *a, const void *b) {
@@ -832,6 +942,7 @@ static void zi_show_folder(ZiApp *app) {
         app->disk_folder = 1;
     }
     zi_editor_match_folder_tile(app);
+    zi_editor_use_zoom(app);
     zi_redraw(app);
 }
 
@@ -875,6 +986,10 @@ static void zi_sync_menu(ZiApp *app, HMENU menu) {
     CheckMenuItem(view, ZI_CMD_DISK, MF_BYCOMMAND | (app->source_server ? MF_UNCHECKED : MF_CHECKED));
     CheckMenuItem(view, ZI_CMD_SERVER, MF_BYCOMMAND | (app->source_server ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(view, ZI_CMD_SUBFOLDER, MF_BYCOMMAND | (app->subfolders ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(view, ZI_CMD_ROT_LEFT, MF_BYCOMMAND | (zi_editor_can_rotate(app) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(view, ZI_CMD_ROT_RIGHT, MF_BYCOMMAND | (zi_editor_can_rotate(app) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(view, ZI_CMD_FLIP_H, MF_BYCOMMAND | (zi_editor_can_rotate(app) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(view, ZI_CMD_FLIP_V, MF_BYCOMMAND | (zi_editor_can_rotate(app) ? MF_ENABLED : MF_GRAYED));
 }
 
 static HMENU zi_popup_menu(const ZiApp *app) {
@@ -883,8 +998,6 @@ static HMENU zi_popup_menu(const ZiApp *app) {
     if (app->source_server) {
         AppendMenuW(menu, MF_STRING, ZI_CMD_CHOOSE_LIBRARY, L"Choose Library Base Folder");
         AppendMenuW(menu, MF_STRING, ZI_CMD_PAIR, L"Pair with Helper");
-        AppendMenuW(menu, zi_library_clean_ready(app) ? MF_STRING : MF_STRING | MF_GRAYED,
-                    ZI_CMD_CLEAN, L"Clean folder");
     } else {
         AppendMenuW(menu, MF_STRING, ZI_CMD_OPEN_FILE, L"Open File");
         AppendMenuW(menu, MF_STRING, ZI_CMD_OPEN_FOLDER, L"Open Folder");
@@ -1215,6 +1328,171 @@ static void zi_on_click(ZiApp *app, int id, int extra, int x) {
         app->drag_anchor_x = pt.x;
         SetCapture(app->hwnd);
         break;
+    case ZI_ID_FLATTEN:
+        zi_editor_flatten(app);
+        break;
+    case ZI_ID_REDEYE:
+        zi_editor_redeye_toggle(app);
+        break;
+    case ZI_ID_CURVE_RGB:
+        zi_editor_curve_channel(app, 0);
+        break;
+    case ZI_ID_CURVE_RED:
+        zi_editor_curve_channel(app, 1);
+        break;
+    case ZI_ID_CURVE_GREEN:
+        zi_editor_curve_channel(app, 2);
+        break;
+    case ZI_ID_CURVE_BLUE:
+        zi_editor_curve_channel(app, 3);
+        break;
+    case ZI_ID_CURVE_LINEAR:
+        zi_editor_curve_preset(app, 0);
+        break;
+    case ZI_ID_CURVE_MATTE:
+        zi_editor_curve_preset(app, 1);
+        break;
+    case ZI_ID_CURVE_MOODY:
+        zi_editor_curve_preset(app, 2);
+        break;
+    case ZI_ID_CURVE_PUNCH:
+        zi_editor_curve_preset(app, 3);
+        break;
+    case ZI_ID_CURVE_LOFI:
+        zi_editor_curve_preset(app, 4);
+        break;
+    case ZI_ID_FIND: {
+        wchar_t text[ZI_NAME];
+
+        wcscpy_s(text, ZI_NAME, app->name_filter);
+        if (zi_ask_name(app->hwnd, L"Find", text, ZI_NAME)) {
+            zi_grid_set_filter(app, text);
+        }
+        break;
+    }
+    case ZI_ID_CLEAR_FILTER:
+        zi_grid_set_filter(app, L"");
+        break;
+    case ZI_ID_PAGE_FIRST:
+        zi_grid_set_page(app, 0);
+        break;
+    case ZI_ID_PAGE_PREV:
+        zi_grid_set_page(app, app->file_page - 1);
+        break;
+    case ZI_ID_PAGE_NEXT:
+        zi_grid_set_page(app, app->file_page + 1);
+        break;
+    case ZI_ID_PAGE_LAST:
+        zi_grid_set_page(app, zi_grid_page_count(app) - 1);
+        break;
+    case ZI_ID_FOLD_DATE:
+        app->fold_date = !app->fold_date;
+        zi_redraw(app);
+        break;
+    case ZI_ID_FOLD_MOVE:
+        app->fold_move = !app->fold_move;
+        zi_redraw(app);
+        break;
+    case ZI_ID_FOLD_MERGE:
+        app->fold_merge = !app->fold_merge;
+        zi_redraw(app);
+        break;
+    case ZI_ID_FOLD_BUILD:
+        app->fold_build = !app->fold_build;
+        zi_redraw(app);
+        break;
+    case ZI_ID_MOVE_NAME: {
+        wchar_t text[ZI_NAME];
+
+        wcscpy_s(text, ZI_NAME, app->move_name);
+        if (zi_ask_name(app->hwnd, L"Folder", text, ZI_NAME)) {
+            wcscpy_s(app->move_name, ZI_NAME, text);
+            zi_redraw(app);
+        }
+        break;
+    }
+    case ZI_ID_MOVE_SUB:
+        app->move_sub = !app->move_sub;
+        zi_redraw(app);
+        break;
+    case ZI_ID_MOVE_GO:
+        if (app->source_server) {
+            zi_notice(app, L"Move on the server is left for a confirmed run.");
+            break;
+        }
+        if (zi_disk_move_marked(app, app->move_name, app->move_sub)) {
+            if (app->move_sub && app->folder_selected >= 0 && app->folder_selected < app->folder_count) {
+                app->folders[app->folder_selected].loaded = 0;
+                zi_expand_folder(app, app->folder_selected);
+            } else {
+                zi_list_folders(app);
+            }
+            zi_redraw(app);
+        }
+        break;
+    case ZI_ID_ORGANIZE:
+        if (app->source_server) {
+            zi_notice(app, L"Organize on the server is left for a confirmed run.");
+            break;
+        }
+        if (zi_ask(app, L"Organize the photos on this page into year and day folders?",
+                   MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            zi_disk_organize(app);
+        }
+        break;
+    case ZI_ID_CLEAN_DATE: {
+        wchar_t dir[MAX_PATH];
+
+        if (!zi_current_folder(app, dir, MAX_PATH)) {
+            break;
+        }
+        if (app->source_server || (dir[0] == L'\\' && dir[1] == L'\\')) {
+            zi_notice(app, L"Clean on the server is left for a confirmed run.");
+            break;
+        }
+        if (zi_ask(app, L"Delete empty folders and junk files in this folder?",
+                   MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            zi_clean_junk(dir, 0);
+        }
+        break;
+    }
+    case ZI_ID_RESCAN:
+        zi_notice(app, L"Rescan on the server is left for a confirmed run.");
+        break;
+    case ZI_ID_BUILD_PREV:
+        zi_grid_build_previews(app);
+        break;
+    case ZI_ID_DELETE_ALL: {
+        wchar_t dir[MAX_PATH];
+
+        if (zi_ask(app, L"Are you sure, all _Removed photos will be deleted from the server?",
+                   MB_YESNO | MB_ICONWARNING) != IDYES) {
+            break;
+        }
+        if (zi_current_folder(app, dir, MAX_PATH)) {
+            zi_delete_tree_files(dir);
+            zi_grid_load(app);
+        }
+        break;
+    }
+    case ZI_ID_MERGE_H:
+        zi_merge_arm(app, 0);
+        break;
+    case ZI_ID_MERGE_V:
+        zi_merge_arm(app, 1);
+        break;
+    case ZI_ID_MERGE_OK:
+        zi_merge_accept(app);
+        break;
+    case ZI_ID_MERGE_CANCEL:
+        zi_merge_cancel(app);
+        break;
+    case ZI_ID_MERGE_FIT:
+        zi_merge_fit(app, 0);
+        break;
+    case ZI_ID_MERGE_FULL:
+        zi_merge_fit(app, 1);
+        break;
     default:
         break;
     }
@@ -1440,6 +1718,86 @@ static void zi_size_label(const wchar_t *path, wchar_t *dest, size_t cap) {
     swprintf_s(dest, cap, L"%.1f MB", (double)bytes / 1000000.0);
 }
 
+static void zi_rename_clicked_file(ZiApp *app, int index) {
+    wchar_t name[ZI_NAME];
+    const wchar_t *leaf;
+
+    if (!app || index < 0 || index >= app->file_count) {
+        return;
+    }
+    if (app->source_server) {
+        zi_notice(app, L"Rename on the server is left for a confirmed run.");
+        return;
+    }
+    leaf = wcsrchr(app->files[index].path, L'\\');
+    leaf = (leaf && leaf[1]) ? leaf + 1 : app->files[index].name;
+    wcscpy_s(name, ZI_NAME, leaf);
+    if (!zi_ask_name(app->hwnd, L"Rename", name, ZI_NAME)) {
+        return;
+    }
+    if (zi_rename_file(app, app->files[index].path, name, 0)) {
+        zi_grid_load(app);
+    }
+}
+
+static void zi_rename_clicked_folder(ZiApp *app, int index) {
+    wchar_t path[MAX_PATH];
+    wchar_t name[ZI_NAME];
+    int parent;
+
+    if (!app || index < 0 || index >= app->folder_count) {
+        return;
+    }
+    if (app->source_server) {
+        zi_notice(app, L"Rename on the server is left for a confirmed run.");
+        return;
+    }
+    if (!zi_node_dir(app, index, path, MAX_PATH)) {
+        return;
+    }
+    parent = app->folders[index].parent;
+    wcscpy_s(name, ZI_NAME, app->folders[index].name);
+    if (!zi_ask_name(app->hwnd, L"Rename", name, ZI_NAME)) {
+        return;
+    }
+    if (!zi_rename_folder(app, path, name, 0)) {
+        return;
+    }
+    if (parent < 0) {
+        zi_list_folders(app);
+    } else if (parent < app->folder_count) {
+        app->folders[parent].loaded = 0;
+        zi_expand_folder(app, parent);
+    }
+    zi_redraw(app);
+}
+
+static void zi_show_folder_menu(ZiApp *app, int index, int x, int y) {
+    HMENU menu;
+    POINT pt;
+    int cmd;
+
+    if (index < 0 || index >= app->folder_count) {
+        return;
+    }
+    menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
+    AppendMenuW(menu, MF_STRING, ZI_CMD_CTX_RENAME, L"Rename");
+    pt.x = x;
+    pt.y = y;
+    ClientToScreen(app->hwnd, &pt);
+    SetForegroundWindow(app->hwnd);
+    cmd = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                         pt.x, pt.y, 0, app->hwnd, NULL);
+    PostMessageW(app->hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (cmd == ZI_CMD_CTX_RENAME) {
+        zi_rename_clicked_folder(app, index);
+    }
+}
+
 static void zi_show_file_menu(ZiApp *app, int index, int x, int y) {
     IAssocHandler *handlers[ZI_CTX_APPS];
     int handler_count = 0;
@@ -1472,6 +1830,7 @@ static void zi_show_file_menu(ZiApp *app, int index, int x, int y) {
         return;
     }
     if (video) {
+        AppendMenuW(menu, MF_STRING, ZI_CMD_CTX_PLAY, L"Play");
         if (handler_count > 0) {
             wchar_t app_name[128];
 
@@ -1500,6 +1859,9 @@ static void zi_show_file_menu(ZiApp *app, int index, int x, int y) {
     AppendMenuW(menu, MF_STRING | (video ? MF_GRAYED : MF_ENABLED), ZI_CMD_CTX_COPY, L"Copy settings");
     AppendMenuW(menu, MF_STRING | (zi_paste_targets(app, index) > 0 ? MF_ENABLED : MF_GRAYED),
                 ZI_CMD_CTX_PASTE, L"Paste settings");
+    if (!app->merge_open) {
+        AppendMenuW(menu, MF_STRING, ZI_CMD_CTX_RENAME, L"Rename");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     zi_size_label(path, size_text, 64);
     AppendMenuW(menu, MF_GRAYED | MF_STRING, ZI_CMD_CTX_SIZE, size_text);
@@ -1519,9 +1881,11 @@ static void zi_show_file_menu(ZiApp *app, int index, int x, int y) {
     cmd = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                          pt.x, pt.y, 0, app->hwnd, NULL);
     PostMessageW(app->hwnd, WM_NULL, 0, 0);
-    if (cmd == ZI_CMD_CTX_EDIT) {
+    if (cmd == ZI_CMD_CTX_EDIT || cmd == ZI_CMD_CTX_PLAY) {
         zi_grid_select_only(app, index);
         zi_editor_open_path(app, path);
+    } else if (cmd == ZI_CMD_CTX_RENAME) {
+        zi_rename_clicked_file(app, index);
     } else if (cmd == ZI_CMD_CTX_REVEAL) {
         zi_show_in_explorer(app, path);
     } else if (cmd == ZI_CMD_CTX_OPEN) {
@@ -1617,6 +1981,18 @@ static void zi_on_command(ZiApp *app, int cmd) {
     case ZI_CMD_PASTE:
         zi_editor_paste(app);
         break;
+    case ZI_CMD_ROT_LEFT:
+        zi_editor_rotate(app, 0);
+        break;
+    case ZI_CMD_ROT_RIGHT:
+        zi_editor_rotate(app, 1);
+        break;
+    case ZI_CMD_FLIP_H:
+        zi_editor_flip(app, 1);
+        break;
+    case ZI_CMD_FLIP_V:
+        zi_editor_flip(app, 0);
+        break;
     default:
         break;
     }
@@ -1672,6 +2048,37 @@ static void zi_spectrum_drag(ZiApp *app, int x) {
 }
 
 static int g_touch_drag;
+static int g_curve_on;
+static int g_curve_index;
+static ZiCurves g_curve_edit;
+
+static ZiCurve *zi_drag_curve(void) {
+    if (g_curve_edit.master.count < 0) {
+        zi_curves_identity(&g_curve_edit);
+    }
+    if (g_app.curve_channel == 1) {
+        return &g_curve_edit.red;
+    }
+    if (g_app.curve_channel == 2) {
+        return &g_curve_edit.green;
+    }
+    if (g_app.curve_channel == 3) {
+        return &g_curve_edit.blue;
+    }
+    return &g_curve_edit.master;
+}
+
+static void zi_curve_end(ZiApp *app, int commit) {
+    if (!g_curve_on) {
+        return;
+    }
+    g_curve_on = 0;
+    zi_editor_curve_apply(app, &g_curve_edit, commit);
+    if (!app->drag_split && !app->drag_pan && !app->drag_zoom && !app->drag_preview &&
+        !app->drag_slider && !app->drag_spectrum && !app->drag_crop && !g_touch_drag) {
+        ReleaseCapture();
+    }
+}
 
 static void zi_touch_slider_drag(ZiApp *app, int x) {
     int i;
@@ -1701,7 +2108,7 @@ static void zi_touch_slider_drag(ZiApp *app, int x) {
             t = 1;
         }
         if (g_touch_drag == ZI_ID_TOUCH_SIZE) {
-            zi_editor_touch_size_set(app, 8 + (int)(t * 392.0 + 0.5), 0);
+            zi_editor_touch_size_set(app, 8 + (int)(t * 192.0 + 0.5), 0);
         } else if (g_touch_drag == ZI_ID_SCRATCH_AMOUNT) {
             zi_editor_touch_amount_set(app, 1, (float)t);
         } else {
@@ -1854,6 +2261,13 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         zi_library_startup(hwnd);
         return 0;
     case WM_TIMER:
+        if (g_modal) {
+            return 0;
+        }
+        if (wparam == 3 && app) {
+            zi_media_on_timer(app);
+            return 0;
+        }
         if (wparam == 1 && app && app->source_server) {
             zi_helper_refresh(hwnd);
             zi_library_refresh_pass(app);
@@ -2079,6 +2493,34 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
                 zi_grid_preview_drag(app, x);
                 return 0;
             }
+            if (id == ZI_ID_CURVE_GRAPH) {
+                double nx = 0;
+                double ny = 0;
+                int index = -1;
+
+                if (zi_curve_point_at(app, x, y, &index, &nx, &ny)) {
+                    g_curve_edit = app->edit.curves;
+                    if (index < 0) {
+                        index = zi_curve_insert(zi_drag_curve(), nx);
+                    }
+                    g_curve_index = index;
+                    g_curve_on = 1;
+                    if (index >= 0) {
+                        zi_curve_move(zi_drag_curve(), index, nx, ny);
+                    }
+                    zi_editor_curve_apply(app, &g_curve_edit, 0);
+                    SetCapture(hwnd);
+                }
+                return 0;
+            }
+            if (id == ZI_ID_NONE && app->merge_open &&
+                zi_merge_pointer(app, x, y, 1, (GetKeyState(VK_MENU) & 0x8000) != 0, app->space_down)) {
+                SetCapture(hwnd);
+                return 0;
+            }
+            if (id == ZI_ID_NONE && app->video_open && zi_media_click(app, x, y)) {
+                return 0;
+            }
             if (id == ZI_ID_NONE && zi_grid_click(app, x, y)) {
                 zi_editor_sync_details(app);
                 return 0;
@@ -2120,6 +2562,26 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
                 zi_editor_touch_size_set(app, 48, 1);
                 return 0;
             }
+            if (id == ZI_ID_CURVE_GRAPH) {
+                double nx = 0;
+                double ny = 0;
+                int point = -1;
+                ZiCurve *curve;
+
+                g_curve_on = 0;
+                if (!zi_curve_point_at(app, x, y, &point, &nx, &ny) || point < 0) {
+                    return 0;
+                }
+                g_curve_edit = app->edit.curves;
+                curve = zi_drag_curve();
+                if (point == 0 || point == curve->count - 1) {
+                    zi_curve_reset_end(curve, point);
+                } else {
+                    zi_curve_remove(curve, point);
+                }
+                zi_editor_curve_apply(app, &g_curve_edit, 1);
+                return 0;
+            }
             if (id == ZI_ID_DUST_AMOUNT || id == ZI_ID_SCRATCH_AMOUNT) {
                 zi_editor_touch_amount_begin(app, id == ZI_ID_SCRATCH_AMOUNT);
                 zi_editor_touch_amount_set(app, id == ZI_ID_SCRATCH_AMOUNT, 1.0f);
@@ -2141,6 +2603,15 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             int index;
 
             zi_layout_now(app);
+            {
+                int extra = 0;
+                int hit = zi_chrome_hittest(app, x, y, &extra);
+
+                if (hit == ZI_ID_TREE) {
+                    zi_show_folder_menu(app, extra, x, y);
+                    return 0;
+                }
+            }
             index = zi_grid_index_at(app, x, y);
             if (index >= 0 && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 zi_grid_click(app, x, y);
@@ -2155,6 +2626,19 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         }
         return 0;
     case WM_MOUSEMOVE:
+        if (app && g_curve_on) {
+            double nx = 0;
+            double ny = 0;
+
+            zi_curve_point_at(app, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), NULL, &nx, &ny);
+            if (g_curve_index >= 0) {
+                zi_curve_move(zi_drag_curve(), g_curve_index, nx, ny);
+                zi_editor_curve_apply(app, &g_curve_edit, 0);
+            }
+        }
+        if (app && zi_merge_dragging()) {
+            zi_merge_pointer(app, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), 1, 0, 1);
+        }
         if (app && (app->drag_pan || app->drag_crop || app->spot_tool || app->scratch_tool || app->scratch_drag)) {
             zi_editor_mouse_move(app, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
         }
@@ -2175,12 +2659,26 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     case WM_LBUTTONUP:
     case WM_CANCELMODE:
         if (app) {
+            zi_curve_end(app, 1);
+            if (zi_merge_dragging()) {
+                zi_merge_pointer(app, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), 0, 0, 0);
+            }
             zi_release_drag(app);
         }
         return 0;
     case WM_KEYDOWN:
         if (app && wparam == VK_SPACE) {
+            HWND focus = GetFocus();
+
             app->space_down = 1;
+            if (app->video_open && (focus == app->hwnd || focus == NULL)) {
+                zi_media_toggle(app);
+            }
+            return 0;
+        }
+        if (app && app->merge_open &&
+            (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN) &&
+            zi_merge_key(app, (int)wparam)) {
             return 0;
         }
         if (app && wparam == VK_LEFT) {
@@ -2235,6 +2733,8 @@ static LRESULT CALLBACK zi_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
+        KillTimer(hwnd, 3);
+        zi_media_shutdown();
         zi_remember_disk(&g_app);
         zi_editor_shutdown(&g_app);
         zi_library_shutdown();
@@ -2269,6 +2769,11 @@ static HMENU zi_menu_bar(void) {
     AppendMenuW(edit, MF_STRING, ZI_CMD_PASTE, L"Paste\tCtrl+V");
     AppendMenuW(view, MF_STRING, ZI_CMD_FOLDER_VIEW, L"Folder View\tCtrl+F");
     AppendMenuW(view, MF_STRING, ZI_CMD_IMAGE_VIEW, L"Edit View\tCtrl+E");
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(view, MF_STRING, ZI_CMD_ROT_LEFT, L"Rotate Counterclockwise");
+    AppendMenuW(view, MF_STRING, ZI_CMD_ROT_RIGHT, L"Rotate Clockwise");
+    AppendMenuW(view, MF_STRING, ZI_CMD_FLIP_H, L"Flip Left/Right");
+    AppendMenuW(view, MF_STRING, ZI_CMD_FLIP_V, L"Flip Top/Bottom");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, ZI_CMD_DISK, L"Disk");
     AppendMenuW(view, MF_STRING, ZI_CMD_SERVER, L"Server");
@@ -2325,6 +2830,10 @@ int zi_run(HINSTANCE instance) {
     for (i = 0; i < ZI_SECTIONS; i++) {
         g_app.section_open[i] = 1;
     }
+    g_app.fold_date = 1;
+    g_app.fold_move = 1;
+    g_app.fold_merge = 1;
+    g_app.fold_build = 1;
 
     ZeroMemory(&wc, sizeof wc);
     wc.style = CS_DBLCLKS;
@@ -2333,6 +2842,12 @@ int zi_run(HINSTANCE instance) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.lpszClassName = L"ZImager";
+    if (!RegisterClassW(&wc)) {
+        return 1;
+    }
+    wc.lpfnWndProc = zi_name_proc;
+    wc.lpszClassName = L"ZImagerName";
+    wc.style = CS_DBLCLKS;
     if (!RegisterClassW(&wc)) {
         return 1;
     }

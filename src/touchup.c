@@ -1,6 +1,7 @@
-/* Dust and scratch repair, matching ZImager Touchup.swift.
+/* Dust, scratch, and red-eye repair, matching ZImager Touchup.swift.
    Samples are linear RGB, three floats, row 0 at the top. Object removal is absent. */
 #include "touchup.h"
+#include "features.h"
 
 #include <wincodec.h>
 #include <objbase.h>
@@ -164,6 +165,10 @@ static int zi_op_same(const ZiTouchOp *a, const ZiTouchOp *b, int strength) {
             return 0;
         }
     }
+    if (a->has_orient != b->has_orient || a->mask_turns != b->mask_turns ||
+        a->mask_flip_h != b->mask_flip_h || a->mask_flip_v != b->mask_flip_v) {
+        return 0;
+    }
     if (fabsf(a->feather - b->feather) > 0.01f) {
         return 0;
     }
@@ -290,6 +295,35 @@ void zi_touch_set_strength(ZiTouchDoc *doc, const char *model, float strength) {
         strength = 1.0f;
     }
     doc->ops[index].strength = strength;
+}
+
+void zi_touch_capture_orient(ZiTouchDoc *doc, int turns, int flip_h, int flip_v) {
+    int i;
+    int count;
+    int wrapped;
+
+    if (!doc) {
+        return;
+    }
+    count = doc->count;
+    if (count < 0) {
+        return;
+    }
+    if (count > ZI_TOUCH_CAP) {
+        count = ZI_TOUCH_CAP;
+    }
+    wrapped = zi_wrap_turns(turns);
+    flip_h = flip_h ? 1 : 0;
+    flip_v = flip_v ? 1 : 0;
+    for (i = 0; i < count; i++) {
+        if (doc->ops[i].has_orient) {
+            continue;
+        }
+        doc->ops[i].has_orient = 1;
+        doc->ops[i].mask_turns = wrapped;
+        doc->ops[i].mask_flip_h = flip_h;
+        doc->ops[i].mask_flip_v = flip_v;
+    }
 }
 
 int zi_touch_one_added(const ZiTouchDoc *prev, const ZiTouchDoc *next) {
@@ -1702,10 +1736,7 @@ int zi_touch_stroke_mask(int w, int h, const int *xs, const int *ys, int count, 
         free(ry);
         return -1;
     }
-    spacing = radius / 2;
-    if (spacing < 1) {
-        spacing = 1;
-    }
+    spacing = zi_scratch_spacing(radius);
     for (i = 1; i < rn; i++) {
         float dx = (float)(rx[i] - rx[i - 1]);
         float dy = (float)(ry[i] - ry[i - 1]);
@@ -2068,66 +2099,258 @@ static void zi_fill_dust(float *filled, const float *samples, const float *high,
     free(boundary);
 }
 
-typedef struct ZiWalk {
-    int found;
-    int index;
-    float distance;
-} ZiWalk;
+typedef struct ZiOutsideField {
+    int x0;
+    int y0;
+    int width;
+    int height;
+    int *origin_x;
+    int *origin_y;
+} ZiOutsideField;
 
-static ZiWalk zi_walk(const unsigned char *hole, int w, int h, int x, int y, float dx, float dy, int limit) {
-    ZiWalk result;
-    int step;
-
-    result.found = 0;
-    result.index = 0;
-    result.distance = 0;
-    if (limit < 1) {
-        limit = 1;
+static void zi_field_free(ZiOutsideField *field) {
+    if (!field) {
+        return;
     }
-    for (step = 1; step <= limit; step++) {
-        int nx = zi_round_f((float)x + dx * (float)step);
-        int ny = zi_round_f((float)y + dy * (float)step);
-        int index;
-
-        if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
-            return result;
-        }
-        index = ny * w + nx;
-        if (hole[index] == 0) {
-            result.found = 1;
-            result.index = index;
-            result.distance = (float)step;
-            return result;
-        }
-    }
-    return result;
+    free(field->origin_x);
+    free(field->origin_y);
+    field->origin_x = NULL;
+    field->origin_y = NULL;
 }
 
-static int zi_grain(const float *high, const unsigned char *hole, int w, int h, int index, float along_x, float along_y,
-                    float *red, float *green, float *blue) {
-    static const int distances[4] = {7, 11, 4, 0};
-    int x = index % w;
-    int y = index / w;
-    int d;
+/* Nearest outside pixel of each stroke pixel. The search stays in the stroke box. */
+static int zi_outside_field(const unsigned char *hole, const ZiBlob *blob, int w, int h, ZiOutsideField *field) {
+    int x0 = blob->min_x - 2;
+    int y0 = blob->min_y - 2;
+    int x1 = blob->max_x + 2;
+    int y1 = blob->max_y + 2;
+    int box_w;
+    int box_h;
+    size_t n;
+    int *queue = NULL;
+    int qn = 0;
+    int head = 0;
+    int y;
+    size_t i;
 
-    for (d = 0; d < 4; d++) {
-        int nx = zi_round_f((float)x + along_x * (float)distances[d]);
-        int ny = zi_round_f((float)y + along_y * (float)distances[d]);
-        int sample;
+    memset(field, 0, sizeof *field);
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 >= w) {
+        x1 = w - 1;
+    }
+    if (y1 >= h) {
+        y1 = h - 1;
+    }
+    box_w = x1 - x0 + 1;
+    box_h = y1 - y0 + 1;
+    if (box_w < 1 || box_h < 1 || (size_t)box_w > SIZE_MAX / (size_t)box_h) {
+        return 0;
+    }
+    n = (size_t)box_w * (size_t)box_h;
+    field->x0 = x0;
+    field->y0 = y0;
+    field->width = box_w;
+    field->height = box_h;
+    field->origin_x = (int *)malloc(n * sizeof(int));
+    field->origin_y = (int *)malloc(n * sizeof(int));
+    queue = (int *)malloc(n * sizeof(int));
+    if (!field->origin_x || !field->origin_y || !queue) {
+        free(queue);
+        zi_field_free(field);
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        field->origin_x[i] = -1;
+        field->origin_y[i] = -1;
+    }
+    for (y = y0; y <= y1; y++) {
+        int x;
+
+        for (x = x0; x <= x1; x++) {
+            int global = y * w + x;
+            int touches;
+            int local;
+
+            if (hole[global] != 0) {
+                continue;
+            }
+            touches = (x > 0 && hole[global - 1] != 0) ||
+                      (x + 1 < w && hole[global + 1] != 0) ||
+                      (y > 0 && hole[global - w] != 0) ||
+                      (y + 1 < h && hole[global + w] != 0);
+            if (!touches) {
+                continue;
+            }
+            local = (y - y0) * box_w + (x - x0);
+            field->origin_x[local] = x;
+            field->origin_y[local] = y;
+            queue[qn++] = local;
+        }
+    }
+    while (head < qn) {
+        int current = queue[head++];
+        int local_x = current % box_w;
+        int local_y = current / box_w;
+        int seed_x = field->origin_x[current];
+        int seed_y = field->origin_y[current];
+        int px = x0 + local_x;
+        int py = y0 + local_y;
+        int k;
+
+        for (k = 0; k < 4; k++) {
+            int nx = px + (k == 0 ? -1 : (k == 1 ? 1 : 0));
+            int ny = py + (k == 2 ? -1 : (k == 3 ? 1 : 0));
+            int local;
+
+            if (nx < x0 || ny < y0 || nx > x1 || ny > y1) {
+                continue;
+            }
+            if (hole[ny * w + nx] == 0) {
+                continue;
+            }
+            local = (ny - y0) * box_w + (nx - x0);
+            if (field->origin_x[local] >= 0) {
+                continue;
+            }
+            field->origin_x[local] = seed_x;
+            field->origin_y[local] = seed_y;
+            queue[qn++] = local;
+        }
+    }
+    free(queue);
+    return 1;
+}
+
+static int zi_field_seed(const ZiOutsideField *field, int x, int y, int *sx, int *sy) {
+    int local_x = x - field->x0;
+    int local_y = y - field->y0;
+    int index;
+
+    if (local_x < 0 || local_y < 0 || local_x >= field->width || local_y >= field->height) {
+        return 0;
+    }
+    index = local_y * field->width + local_x;
+    if (field->origin_x[index] < 0) {
+        return 0;
+    }
+    *sx = field->origin_x[index];
+    *sy = field->origin_y[index];
+    return 1;
+}
+
+/* The other side of the stroke. 0 at a round end, where the far side is a long walk. */
+static int zi_opposite_exit(const unsigned char *hole, int w, int h, int x, int y, float ux, float uy,
+                            float close_dist, int *out_x, int *out_y, float *out_dist) {
+    int limit = (int)(close_dist * 4.0f) + 8;
+    int step;
+
+    if (limit < 24) {
+        limit = 24;
+    }
+    if (limit > 512) {
+        limit = 512;
+    }
+    for (step = 1; step <= limit; step++) {
+        int nx = zi_round_f((float)x + ux * (float)step);
+        int ny = zi_round_f((float)y + uy * (float)step);
+        float dx;
+        float dy;
+        float distance;
 
         if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
+            return 0;
+        }
+        if (hole[ny * w + nx] != 0) {
             continue;
         }
-        sample = ny * w + nx;
-        if (hole[sample]) {
-            continue;
+        dx = (float)(nx - x);
+        dy = (float)(ny - y);
+        distance = sqrtf(dx * dx + dy * dy);
+        if (distance > close_dist * 3.0f + 8.0f) {
+            return 0;
         }
-        *red = zi_at(high, sample, 0);
-        *green = zi_at(high, sample, 1);
-        *blue = zi_at(high, sample, 2);
+        *out_x = nx;
+        *out_y = ny;
+        *out_dist = distance;
         return 1;
     }
     return 0;
+}
+
+static int zi_outside_average(const float *samples, const unsigned char *hole, int w, int h, int x, int y,
+                              float tx, float ty, float *red, float *green, float *blue) {
+    int step;
+    float sum_r = 0;
+    float sum_g = 0;
+    float sum_b = 0;
+    float count = 0;
+
+    if (x < 0 || y < 0 || x >= w || y >= h || hole[y * w + x] != 0) {
+        return 0;
+    }
+    for (step = -1; step <= 1; step++) {
+        int sx = zi_round_f((float)x + tx * (float)step);
+        int sy = zi_round_f((float)y + ty * (float)step);
+        int index;
+
+        if (sx < 0 || sy < 0 || sx >= w || sy >= h) {
+            continue;
+        }
+        index = sy * w + sx;
+        if (hole[index] != 0) {
+            continue;
+        }
+        sum_r += zi_at(samples, index, 0);
+        sum_g += zi_at(samples, index, 1);
+        sum_b += zi_at(samples, index, 2);
+        count += 1.0f;
+    }
+    if (count <= 0) {
+        return 0;
+    }
+    *red = sum_r / count;
+    *green = sum_g / count;
+    *blue = sum_b / count;
+    return 1;
+}
+
+/* Color continued from outside the stroke, mirrored across this edge. */
+static void zi_side_color(const float *samples, const unsigned char *hole, int w, int h, int pixel_x, int pixel_y,
+                          int exit_x, int exit_y, float *red, float *green, float *blue) {
+    float dx = (float)(exit_x - pixel_x);
+    float dy = (float)(exit_y - pixel_y);
+    float len = sqrtf(dx * dx + dy * dy);
+    float tx;
+    float ty;
+    float ux;
+    float uy;
+    int extra;
+    int index;
+
+    if (len < 0.5f) {
+        len = 0.5f;
+    }
+    tx = -dy / len;
+    ty = dx / len;
+    ux = dx / len;
+    uy = dy / len;
+    for (extra = 0; extra <= 2; extra++) {
+        int mx = zi_round_f((float)exit_x + ux * (len + (float)extra));
+        int my = zi_round_f((float)exit_y + uy * (len + (float)extra));
+
+        if (zi_outside_average(samples, hole, w, h, mx, my, tx, ty, red, green, blue)) {
+            return;
+        }
+    }
+    index = exit_y * w + exit_x;
+    *red = zi_at(samples, index, 0);
+    *green = zi_at(samples, index, 1);
+    *blue = zi_at(samples, index, 2);
 }
 
 static void zi_fill_scratch(float *filled, const float *samples, const float *high, const unsigned char *hole,
@@ -2135,102 +2358,66 @@ static void zi_fill_scratch(float *filled, const float *samples, const float *hi
     int boundary_count = 0;
     int *boundary = zi_boundary(hole, blob, w, h, &boundary_count);
     ZiRange range;
-    int span = blob->max_x - blob->min_x;
-    int other = blob->max_y - blob->min_y;
-    int limit;
+    ZiOutsideField field;
     int p;
-    static const float dirs[4][2] = {
-        {1.0f, 0.0f},
-        {0.70710678f, 0.70710678f},
-        {0.0f, 1.0f},
-        {-0.70710678f, 0.70710678f},
-    };
 
-    if (other > span) {
-        span = other;
-    }
-    span += 8;
-    if (span < 24) {
-        span = 24;
-    }
-    if (span > 512) {
-        span = 512;
-    }
-    limit = span;
+    (void)high;
     if (boundary && boundary_count > 0) {
         zi_channel_range(samples, boundary, boundary_count, &range);
     } else {
         zi_channel_range(samples, blob->pixels, blob->count, &range);
     }
+    free(boundary);
+    if (!zi_outside_field(hole, blob, w, h, &field)) {
+        return;
+    }
     for (p = 0; p < blob->count; p++) {
         int index = blob->pixels[p];
         int x = index % w;
         int y = index / w;
-        int best_score = 2147483647;
-        ZiWalk positive = {0};
-        ZiWalk negative = {0};
-        float along_x = 1;
-        float along_y = 0;
-        float red = zi_at(samples, index, 0);
-        float green = zi_at(samples, index, 1);
-        float blue = zi_at(samples, index, 2);
-        int d;
+        int edge_x = 0;
+        int edge_y = 0;
+        float vx;
+        float vy;
+        float close_dist;
+        float ux;
+        float uy;
+        float red;
+        float green;
+        float blue;
+        int other_x = 0;
+        int other_y = 0;
+        float other_dist = 0;
 
-        for (d = 0; d < 4; d++) {
-            ZiWalk forward = zi_walk(hole, w, h, x, y, dirs[d][0], dirs[d][1], limit);
-            ZiWalk backward = zi_walk(hole, w, h, x, y, -dirs[d][0], -dirs[d][1], limit);
-            int missing = (forward.found ? 0 : 1) + (backward.found ? 0 : 1);
-            float distance = (forward.found ? forward.distance : (float)limit) +
-                             (backward.found ? backward.distance : (float)limit);
-            int score = missing * 10000 + (int)distance;
-
-            if (score < best_score) {
-                best_score = score;
-                positive = forward;
-                negative = backward;
-                along_x = -dirs[d][1];
-                along_y = dirs[d][0];
-            }
+        if (!zi_field_seed(&field, x, y, &edge_x, &edge_y)) {
+            continue;
         }
-        if (positive.found && negative.found) {
-            float t = positive.distance / (positive.distance + negative.distance);
-            float gr;
-            float gg;
-            float gb;
-            float or_;
-            float og;
-            float ob;
+        vx = (float)(x - edge_x);
+        vy = (float)(y - edge_y);
+        close_dist = sqrtf(vx * vx + vy * vy);
+        if (close_dist < 0.5f) {
+            continue;
+        }
+        ux = vx / close_dist;
+        uy = vy / close_dist;
+        zi_side_color(samples, hole, w, h, x, y, edge_x, edge_y, &red, &green, &blue);
+        if (zi_opposite_exit(hole, w, h, x, y, ux, uy, close_dist, &other_x, &other_y, &other_dist)) {
+            float other_r;
+            float other_g;
+            float other_b;
+            float t = close_dist / (close_dist + other_dist);
 
-            red = zi_at(samples, positive.index, 0) * (1.0f - t) + zi_at(samples, negative.index, 0) * t;
-            green = zi_at(samples, positive.index, 1) * (1.0f - t) + zi_at(samples, negative.index, 1) * t;
-            blue = zi_at(samples, positive.index, 2) * (1.0f - t) + zi_at(samples, negative.index, 2) * t;
-            if (zi_grain(high, hole, w, h, positive.index, along_x, along_y, &gr, &gg, &gb) &&
-                zi_grain(high, hole, w, h, negative.index, along_x, along_y, &or_, &og, &ob)) {
-                red += (gr + or_) * 0.5f;
-                green += (gg + og) * 0.5f;
-                blue += (gb + ob) * 0.5f;
-            }
-        } else if (positive.found || negative.found) {
-            ZiWalk side = positive.found ? positive : negative;
-            float gr;
-            float gg;
-            float gb;
-
-            red = zi_at(samples, side.index, 0);
-            green = zi_at(samples, side.index, 1);
-            blue = zi_at(samples, side.index, 2);
-            if (zi_grain(high, hole, w, h, side.index, along_x, along_y, &gr, &gg, &gb)) {
-                red += gr;
-                green += gg;
-                blue += gb;
-            }
+            zi_side_color(samples, hole, w, h, x, y, other_x, other_y, &other_r, &other_g, &other_b);
+            red = red * (1.0f - t) + other_r * t;
+            green = green * (1.0f - t) + other_g * t;
+            blue = blue * (1.0f - t) + other_b * t;
         }
         zi_put(filled, index,
                zi_clamp_ch(red, range.r0, range.r1),
                zi_clamp_ch(green, range.g0, range.g1),
                zi_clamp_ch(blue, range.b0, range.b1));
     }
-    free(boundary);
+    zi_field_free(&field);
 }
 
 /* Feather radius follows the model: 3 for scratches, 1 for dust. Strength is applied later. */
@@ -2417,7 +2604,784 @@ static void zi_slot_store(unsigned long long sig, int w, int h, const float *pix
     g_slot_next = (slot + 1) % ZI_TOUCH_CACHE;
 }
 
-void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc) {
+static void zi_mask_flip_h(unsigned char *bytes, int w, int h) {
+    int y;
+    int x;
+
+    for (y = 0; y < h; y++) {
+        unsigned char *row = bytes + (size_t)y * (size_t)w;
+
+        for (x = 0; x < w / 2; x++) {
+            unsigned char tmp = row[x];
+
+            row[x] = row[w - 1 - x];
+            row[w - 1 - x] = tmp;
+        }
+    }
+}
+
+static void zi_mask_flip_v(unsigned char *bytes, int w, int h) {
+    int y;
+    int x;
+
+    for (y = 0; y < h / 2; y++) {
+        unsigned char *top = bytes + (size_t)y * (size_t)w;
+        unsigned char *bottom = bytes + (size_t)(h - 1 - y) * (size_t)w;
+
+        for (x = 0; x < w; x++) {
+            unsigned char tmp = top[x];
+
+            top[x] = bottom[x];
+            bottom[x] = tmp;
+        }
+    }
+}
+
+/* Clockwise quarters. One turn maps (x, y) to (h - 1 - y, x) and swaps the sides. */
+static int zi_mask_rotate(unsigned char **bytes, int *w, int *h, int clockwise) {
+    int turns = zi_wrap_turns(clockwise);
+    int sw;
+    int sh;
+    int dw;
+    int dh;
+    int y;
+    int x;
+    unsigned char *src;
+    unsigned char *dst;
+    size_t n;
+
+    if (turns == 0) {
+        return 1;
+    }
+    sw = *w;
+    sh = *h;
+    src = *bytes;
+    if (turns == 2) {
+        dw = sw;
+        dh = sh;
+    } else {
+        dw = sh;
+        dh = sw;
+    }
+    n = (size_t)dw * (size_t)dh;
+    dst = (unsigned char *)malloc(n);
+    if (!dst) {
+        return 0;
+    }
+    for (y = 0; y < sh; y++) {
+        for (x = 0; x < sw; x++) {
+            int nx;
+            int ny;
+
+            if (turns == 1) {
+                nx = sh - 1 - y;
+                ny = x;
+            } else if (turns == 2) {
+                nx = sw - 1 - x;
+                ny = sh - 1 - y;
+            } else {
+                nx = y;
+                ny = sw - 1 - x;
+            }
+            dst[(size_t)ny * (size_t)dw + (size_t)nx] = src[(size_t)y * (size_t)sw + (size_t)x];
+        }
+    }
+    free(src);
+    *bytes = dst;
+    *w = dw;
+    *h = dh;
+    return 1;
+}
+
+/* Undo the captured orientation, then apply the display orientation. The shared mask is not written. */
+static unsigned char *zi_mask_reorient(const unsigned char *src, int sw, int sh, int from_turns, int from_h,
+                                       int from_v, int to_turns, int to_h, int to_v, int *out_w, int *out_h) {
+    size_t n;
+    unsigned char *bytes;
+    int bw = sw;
+    int bh = sh;
+
+    if (!src || sw < 1 || sh < 1 || (size_t)sw > SIZE_MAX / (size_t)sh) {
+        return NULL;
+    }
+    n = (size_t)sw * (size_t)sh;
+    bytes = (unsigned char *)malloc(n);
+    if (!bytes) {
+        return NULL;
+    }
+    memcpy(bytes, src, n);
+    if (from_v) {
+        zi_mask_flip_v(bytes, bw, bh);
+    }
+    if (from_h) {
+        zi_mask_flip_h(bytes, bw, bh);
+    }
+    if (!zi_mask_rotate(&bytes, &bw, &bh, -from_turns)) {
+        free(bytes);
+        return NULL;
+    }
+    if (!zi_mask_rotate(&bytes, &bw, &bh, to_turns)) {
+        free(bytes);
+        return NULL;
+    }
+    if (to_h) {
+        zi_mask_flip_h(bytes, bw, bh);
+    }
+    if (to_v) {
+        zi_mask_flip_v(bytes, bw, bh);
+    }
+    *out_w = bw;
+    *out_h = bh;
+    return bytes;
+}
+
+static int zi_reddest_pupil(const float *rgb, int w, int h, int x, int y, int radius) {
+    int best = -1;
+    float best_score = -1.0f;
+    long long reach = (long long)radius * (long long)radius;
+    int y0 = y - radius;
+    int y1 = y + radius;
+    int x0 = x - radius;
+    int x1 = x + radius;
+    int row;
+    int col;
+
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y1 >= h) {
+        y1 = h - 1;
+    }
+    if (x1 >= w) {
+        x1 = w - 1;
+    }
+    for (row = y0; row <= y1; row++) {
+        for (col = x0; col <= x1; col++) {
+            long long dx = (long long)col - x;
+            long long dy = (long long)row - y;
+            int index;
+            float red;
+            float green;
+            float blue;
+            float other;
+            float score;
+
+            if (dx * dx + dy * dy > reach) {
+                continue;
+            }
+            index = row * w + col;
+            red = zi_at(rgb, index, 0);
+            green = zi_at(rgb, index, 1);
+            blue = zi_at(rgb, index, 2);
+            if (!zi_is_pupil_red((double)red, (double)green, (double)blue)) {
+                continue;
+            }
+            other = green > blue ? green : blue;
+            score = (red - other) - (float)(dx * dx + dy * dy) * 0.0008f;
+            if (score > best_score) {
+                best_score = score;
+                best = index;
+            }
+        }
+    }
+    return best;
+}
+
+static int zi_mask_neighbor(const unsigned char *mask, int w, int h, int x, int y) {
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        int nx = x + (k == 0 ? -1 : (k == 1 ? 1 : 0));
+        int ny = y + (k == 2 ? -1 : (k == 3 ? 1 : 0));
+
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
+            continue;
+        }
+        if (mask[(size_t)ny * (size_t)w + (size_t)nx]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void zi_hole_seed(unsigned char *seen, int *queue, int *qn, int box_n, const unsigned char *mask, int image_w,
+                         int box_w, int min_x, int min_y, int x, int y) {
+    int local = (y - min_y) * box_w + (x - min_x);
+    size_t index = (size_t)y * (size_t)image_w + (size_t)x;
+
+    if (local < 0 || local >= box_n || mask[index] || seen[local]) {
+        return;
+    }
+    seen[local] = 1;
+    if (*qn < box_n) {
+        queue[(*qn)++] = local;
+    }
+}
+
+/* Unset pixels inside the box that cannot reach the box edge. 255 is a hole. */
+static unsigned char *zi_pupil_holes(const unsigned char *mask, int w, int min_x, int min_y, int max_x, int max_y) {
+    int box_w = max_x - min_x + 1;
+    int box_h = max_y - min_y + 1;
+    int box_n;
+    unsigned char *seen;
+    int *queue;
+    int qn = 0;
+    int head = 0;
+    int x;
+    int y;
+
+    if (box_w < 1 || box_h < 1 || box_w > 20000 || box_h > 20000) {
+        return NULL;
+    }
+    box_n = box_w * box_h;
+    seen = (unsigned char *)calloc((size_t)box_n, 1);
+    queue = (int *)malloc((size_t)box_n * sizeof(int));
+    if (!seen || !queue) {
+        free(seen);
+        free(queue);
+        return NULL;
+    }
+    for (x = min_x; x <= max_x; x++) {
+        zi_hole_seed(seen, queue, &qn, box_n, mask, w, box_w, min_x, min_y, x, min_y);
+        zi_hole_seed(seen, queue, &qn, box_n, mask, w, box_w, min_x, min_y, x, max_y);
+    }
+    for (y = min_y; y <= max_y; y++) {
+        zi_hole_seed(seen, queue, &qn, box_n, mask, w, box_w, min_x, min_y, min_x, y);
+        zi_hole_seed(seen, queue, &qn, box_n, mask, w, box_w, min_x, min_y, max_x, y);
+    }
+    while (head < qn) {
+        int current = queue[head++];
+        int local_x = current % box_w;
+        int local_y = current / box_w;
+        int px = min_x + local_x;
+        int py = min_y + local_y;
+        int k;
+
+        for (k = 0; k < 4; k++) {
+            int nx = px + (k == 0 ? -1 : (k == 1 ? 1 : 0));
+            int ny = py + (k == 2 ? -1 : (k == 3 ? 1 : 0));
+            int local;
+            size_t index;
+
+            if (nx < min_x || ny < min_y || nx > max_x || ny > max_y) {
+                continue;
+            }
+            local = (ny - min_y) * box_w + (nx - min_x);
+            index = (size_t)ny * (size_t)w + (size_t)nx;
+            if (mask[index] || seen[local]) {
+                continue;
+            }
+            seen[local] = 1;
+            if (qn < box_n) {
+                queue[qn++] = local;
+            }
+        }
+    }
+    free(queue);
+    for (y = min_y; y <= max_y; y++) {
+        for (x = min_x; x <= max_x; x++) {
+            int local = (y - min_y) * box_w + (x - min_x);
+            size_t index = (size_t)y * (size_t)w + (size_t)x;
+
+            if (mask[index] == 0 && seen[local] == 0) {
+                seen[local] = 255;
+            } else {
+                seen[local] = 0;
+            }
+        }
+    }
+    return seen;
+}
+
+static int zi_marked_hole(const unsigned char *holes, int box_w, int min_x, int min_y, int max_x, int max_y, int x,
+                          int y) {
+    if (!holes || x < min_x || y < min_y || x > max_x || y > max_y) {
+        return 0;
+    }
+    return holes[(y - min_y) * box_w + (x - min_x)] != 0;
+}
+
+static unsigned char *zi_enlarge_pupil(const unsigned char *mask, int w, int h) {
+    const float pupil_scale = 1.2f;
+    size_t n = (size_t)w * (size_t)h;
+    int min_x = w;
+    int min_y = h;
+    int max_x = 0;
+    int max_y = 0;
+    int count = 0;
+    long long sum_x = 0;
+    long long sum_y = 0;
+    int y;
+    int span;
+    int pad;
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    int box_w;
+    float center_x;
+    float center_y;
+    unsigned char *holes;
+    unsigned char *grown;
+
+    for (y = 0; y < h; y++) {
+        int x;
+
+        for (x = 0; x < w; x++) {
+            if (!mask[(size_t)y * (size_t)w + (size_t)x]) {
+                continue;
+            }
+            sum_x += x;
+            sum_y += y;
+            count++;
+            if (x < min_x) {
+                min_x = x;
+            }
+            if (x > max_x) {
+                max_x = x;
+            }
+            if (y < min_y) {
+                min_y = y;
+            }
+            if (y > max_y) {
+                max_y = y;
+            }
+        }
+    }
+    grown = (unsigned char *)malloc(n);
+    if (!grown) {
+        return NULL;
+    }
+    memcpy(grown, mask, n);
+    if (count < 1) {
+        return grown;
+    }
+    holes = zi_pupil_holes(mask, w, min_x, min_y, max_x, max_y);
+    if (!holes) {
+        free(grown);
+        return NULL;
+    }
+    center_x = (float)sum_x / (float)count;
+    center_y = (float)sum_y / (float)count;
+    span = max_x - min_x;
+    if (max_y - min_y > span) {
+        span = max_y - min_y;
+    }
+    span += 1;
+    pad = (int)ceilf((float)span * (pupil_scale - 1.0f)) + 2;
+    x0 = min_x - pad;
+    y0 = min_y - pad;
+    x1 = max_x + pad;
+    y1 = max_y + pad;
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 >= w) {
+        x1 = w - 1;
+    }
+    if (y1 >= h) {
+        y1 = h - 1;
+    }
+    box_w = max_x - min_x + 1;
+    for (y = y0; y <= y1; y++) {
+        int x;
+
+        for (x = x0; x <= x1; x++) {
+            size_t index = (size_t)y * (size_t)w + (size_t)x;
+            float src_x;
+            float src_y;
+            int ix;
+            int iy;
+
+            if (grown[index] || zi_marked_hole(holes, box_w, min_x, min_y, max_x, max_y, x, y)) {
+                continue;
+            }
+            src_x = center_x + ((float)x - center_x) / pupil_scale;
+            src_y = center_y + ((float)y - center_y) / pupil_scale;
+            ix = zi_round_f(src_x);
+            iy = zi_round_f(src_y);
+            if (ix < 0 || iy < 0 || ix >= w || iy >= h) {
+                continue;
+            }
+            if (mask[(size_t)iy * (size_t)w + (size_t)ix]) {
+                grown[index] = 255;
+            }
+        }
+    }
+    free(holes);
+    return grown;
+}
+
+int zi_touch_redeye_mask(const float *rgb, int w, int h, int x, int y, unsigned char **mask) {
+    int edge;
+    int grow;
+    int snap = 18;
+    int seed;
+    int seed_x;
+    int seed_y;
+    long long reach;
+    int limit;
+    size_t n;
+    unsigned char *bits = NULL;
+    int *queue = NULL;
+    int qcap;
+    int qn;
+    int head;
+    int count;
+    int min_x;
+    int max_x;
+    int min_y;
+    int max_y;
+    int *extra = NULL;
+    int extra_n = 0;
+    int extra_cap = 0;
+    int i;
+    unsigned char *grown;
+
+    if (mask) {
+        *mask = NULL;
+    }
+    if (!rgb || !mask || !zi_pixels_ok(w, h) || x < 0 || y < 0 || x >= w || y >= h) {
+        return 0;
+    }
+    edge = w < h ? w : h;
+    grow = edge / 18;
+    if (grow > 120) {
+        grow = 120;
+    }
+    if (grow < 28) {
+        grow = 28;
+    }
+    seed = zi_reddest_pupil(rgb, w, h, x, y, snap);
+    if (seed < 0) {
+        return 0;
+    }
+    n = (size_t)w * (size_t)h;
+    bits = (unsigned char *)calloc(n, 1);
+    qcap = 256;
+    queue = (int *)malloc((size_t)qcap * sizeof(int));
+    if (!bits || !queue) {
+        free(bits);
+        free(queue);
+        return -1;
+    }
+    seed_x = seed % w;
+    seed_y = seed / w;
+    bits[seed] = 255;
+    queue[0] = seed;
+    qn = 1;
+    head = 0;
+    count = 1;
+    min_x = seed_x;
+    max_x = seed_x;
+    min_y = seed_y;
+    max_y = seed_y;
+    reach = (long long)grow * (long long)grow;
+    limit = 80000;
+    if ((long long)grow * (long long)grow < limit) {
+        limit = grow * grow;
+    }
+    if (limit < 400) {
+        limit = 400;
+    }
+    while (head < qn && count < limit) {
+        int current = queue[head++];
+        int cx = current % w;
+        int cy = current / w;
+        int k;
+
+        for (k = 0; k < 4; k++) {
+            int nx = cx + (k == 0 ? -1 : (k == 1 ? 1 : 0));
+            int ny = cy + (k == 2 ? -1 : (k == 3 ? 1 : 0));
+            long long dx;
+            long long dy;
+            int next;
+            float red;
+            float green;
+            float blue;
+
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
+                continue;
+            }
+            dx = (long long)nx - seed_x;
+            dy = (long long)ny - seed_y;
+            if (dx * dx + dy * dy > reach) {
+                continue;
+            }
+            next = ny * w + nx;
+            if (bits[next]) {
+                continue;
+            }
+            red = zi_at(rgb, next, 0);
+            green = zi_at(rgb, next, 1);
+            blue = zi_at(rgb, next, 2);
+            if (!zi_is_pupil_red((double)red, (double)green, (double)blue)) {
+                continue;
+            }
+            bits[next] = 255;
+            count++;
+            if (nx < min_x) {
+                min_x = nx;
+            }
+            if (nx > max_x) {
+                max_x = nx;
+            }
+            if (ny < min_y) {
+                min_y = ny;
+            }
+            if (ny > max_y) {
+                max_y = ny;
+            }
+            if (qn >= qcap) {
+                int ncap = qcap * 2;
+                int *grown_q = (int *)realloc(queue, (size_t)ncap * sizeof(int));
+
+                if (!grown_q) {
+                    free(queue);
+                    free(bits);
+                    return -1;
+                }
+                queue = grown_q;
+                qcap = ncap;
+            }
+            queue[qn++] = next;
+        }
+    }
+    free(queue);
+    queue = NULL;
+    if (zi_redeye_reject(count, max_x - min_x + 1, max_y - min_y + 1)) {
+        free(bits);
+        return 0;
+    }
+    {
+        int fx0 = min_x - 1;
+        int fy0 = min_y - 1;
+        int fx1 = max_x + 1;
+        int fy1 = max_y + 1;
+        int fy;
+        int fx;
+
+        if (fx0 < 0) {
+            fx0 = 0;
+        }
+        if (fy0 < 0) {
+            fy0 = 0;
+        }
+        if (fx1 >= w) {
+            fx1 = w - 1;
+        }
+        if (fy1 >= h) {
+            fy1 = h - 1;
+        }
+        for (fy = fy0; fy <= fy1; fy++) {
+            for (fx = fx0; fx <= fx1; fx++) {
+                int index = fy * w + fx;
+                long long dx = (long long)fx - seed_x;
+                long long dy = (long long)fy - seed_y;
+                float red;
+                float green;
+                float blue;
+
+                if (bits[index]) {
+                    continue;
+                }
+                if (dx * dx + dy * dy > reach) {
+                    continue;
+                }
+                if (!zi_mask_neighbor(bits, w, h, fx, fy)) {
+                    continue;
+                }
+                red = zi_at(rgb, index, 0);
+                green = zi_at(rgb, index, 1);
+                blue = zi_at(rgb, index, 2);
+                if (!zi_is_pupil_fringe((double)red, (double)green, (double)blue)) {
+                    continue;
+                }
+                if (extra_n >= extra_cap) {
+                    int ncap = extra_cap < 64 ? 64 : extra_cap * 2;
+                    int *grown_extra = (int *)realloc(extra, (size_t)ncap * sizeof(int));
+
+                    if (!grown_extra) {
+                        free(extra);
+                        free(bits);
+                        return -1;
+                    }
+                    extra = grown_extra;
+                    extra_cap = ncap;
+                }
+                extra[extra_n++] = index;
+            }
+        }
+    }
+    for (i = 0; i < extra_n; i++) {
+        bits[extra[i]] = 255;
+    }
+    free(extra);
+    grown = zi_enlarge_pupil(bits, w, h);
+    free(bits);
+    if (!grown) {
+        return -1;
+    }
+    *mask = grown;
+    return 1;
+}
+
+static float zi_median_channel(float *values, int count) {
+    int mid = count / 2;
+
+    qsort(values, (size_t)count, sizeof(float), zi_cmp_float);
+    if (count % 2 == 1) {
+        return values[mid];
+    }
+    return (values[mid - 1] + values[mid]) * 0.5f;
+}
+
+/* 1 with a color, 0 when the mask has no red core, -1 on allocation failure. */
+static int zi_pupil_fill(const float *samples, const unsigned char *mask, int w, int h, float *red, float *green,
+                         float *blue) {
+    size_t n = (size_t)w * (size_t)h;
+    size_t i;
+    int count = 0;
+    int wrote = 0;
+    float *packed;
+    float *reds;
+    float *greens;
+    float *blues;
+
+    for (i = 0; i < n; i++) {
+        float r;
+        float g;
+        float b;
+
+        if (!mask[i]) {
+            continue;
+        }
+        r = zi_at(samples, (int)i, 0);
+        g = zi_at(samples, (int)i, 1);
+        b = zi_at(samples, (int)i, 2);
+        if (!zi_is_pupil_red((double)r, (double)g, (double)b)) {
+            continue;
+        }
+        count++;
+    }
+    if (count < 1) {
+        return 0;
+    }
+    if ((size_t)count > SIZE_MAX / (3 * sizeof(float))) {
+        return -1;
+    }
+    packed = (float *)malloc((size_t)count * 3 * sizeof(float));
+    if (!packed) {
+        return -1;
+    }
+    reds = packed;
+    greens = packed + count;
+    blues = packed + (size_t)count * 2;
+    for (i = 0; i < n; i++) {
+        float r;
+        float g;
+        float b;
+        float darker;
+
+        if (!mask[i]) {
+            continue;
+        }
+        r = zi_at(samples, (int)i, 0);
+        g = zi_at(samples, (int)i, 1);
+        b = zi_at(samples, (int)i, 2);
+        if (!zi_is_pupil_red((double)r, (double)g, (double)b)) {
+            continue;
+        }
+        if (wrote >= count) {
+            break;
+        }
+        darker = g < b ? g : b;
+        reds[wrote] = r < darker ? r : darker;
+        greens[wrote] = g;
+        blues[wrote] = b;
+        wrote++;
+    }
+    if (wrote < 1) {
+        free(packed);
+        return 0;
+    }
+    *red = zi_median_channel(reds, wrote);
+    *green = zi_median_channel(greens, wrote);
+    *blue = zi_median_channel(blues, wrote);
+    free(packed);
+    return 1;
+}
+
+static float *zi_correct_redeye(const float *samples, const unsigned char *mask, int w, int h) {
+    size_t n = (size_t)w * (size_t)h;
+    float *output;
+    float *alpha;
+    float fill_r = 0;
+    float fill_g = 0;
+    float fill_b = 0;
+    int have_fill;
+    size_t index;
+
+    if (!samples || !mask || w < 2 || h < 2) {
+        return NULL;
+    }
+    output = (float *)malloc(n * 3 * sizeof(float));
+    alpha = zi_blur_mask(mask, w, h, 1);
+    if (!output || !alpha) {
+        free(output);
+        free(alpha);
+        return NULL;
+    }
+    memcpy(output, samples, n * 3 * sizeof(float));
+    have_fill = zi_pupil_fill(samples, mask, w, h, &fill_r, &fill_g, &fill_b);
+    if (have_fill < 0) {
+        free(output);
+        free(alpha);
+        return NULL;
+    }
+    for (index = 0; index < n; index++) {
+        float amount = alpha[index];
+        int pixel = (int)index;
+        float red;
+        float green;
+        float blue;
+        int in_mask;
+
+        if (amount <= 0.001f) {
+            continue;
+        }
+        red = zi_at(samples, pixel, 0);
+        green = zi_at(samples, pixel, 1);
+        blue = zi_at(samples, pixel, 2);
+        in_mask = mask[index] != 0;
+        if (in_mask) {
+            amount = 1.0f;
+        } else if (!zi_is_pupil_fringe((double)red, (double)green, (double)blue)) {
+            continue;
+        } else if (amount > 0.65f) {
+            amount = 0.65f;
+        }
+        if (in_mask && have_fill && !zi_is_pupil_red((double)red, (double)green, (double)blue)) {
+            zi_put(output, pixel, red + (fill_r - red) * amount, green + (fill_g - green) * amount,
+                   blue + (fill_b - blue) * amount);
+        } else {
+            float darker = green < blue ? green : blue;
+            float corrected = red < darker ? red : darker;
+
+            output[(size_t)pixel * 3] = red + (corrected - red) * amount;
+        }
+    }
+    free(alpha);
+    return output;
+}
+
+void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc, int turns, int flip_h, int flip_v) {
     size_t n;
     int count;
     int index;
@@ -2443,7 +3407,17 @@ void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc) {
         unsigned char *scaled = NULL;
         float *repaired = NULL;
         unsigned long long sig = 0;
-        int scratch;
+        int scratch = 0;
+        int redeye = 0;
+        int turn_key;
+        int flip_h_key;
+        int flip_v_key;
+        int from_turns;
+        int from_flip_h;
+        int from_flip_v;
+        int orient_key;
+        int mask_w = 0;
+        int mask_h = 0;
 
         if (!op->mask || !op->mask->bytes || op->mask->w < 1 || op->mask->h < 1) {
             continue;
@@ -2458,9 +3432,18 @@ void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc) {
         if (strength <= 0.001f) {
             continue;
         }
-        if (strcmp(op->model, ZI_TOUCH_DUST) != 0 && strcmp(op->model, ZI_TOUCH_SCRATCH) != 0) {
+        scratch = strcmp(op->model, ZI_TOUCH_SCRATCH) == 0;
+        redeye = strcmp(op->model, ZI_TOUCH_REDEYE) == 0;
+        if (!scratch && !redeye && strcmp(op->model, ZI_TOUCH_DUST) != 0) {
             continue;
         }
+        turn_key = zi_wrap_turns(turns);
+        flip_h_key = flip_h ? 1 : 0;
+        flip_v_key = flip_v ? 1 : 0;
+        from_turns = zi_wrap_turns(op->mask_turns);
+        from_flip_h = op->mask_flip_h ? 1 : 0;
+        from_flip_v = op->mask_flip_v ? 1 : 0;
+        orient_key = op->has_orient ? 1 : 0;
         if (cacheable) {
             if (!hashed) {
                 chain = zi_fnv(chain, rgb, n * 3 * sizeof(float));
@@ -2468,6 +3451,13 @@ void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc) {
             }
             sig = zi_fnv(chain, &w, sizeof w);
             sig = zi_fnv(sig, &h, sizeof h);
+            sig = zi_fnv(sig, &turn_key, sizeof turn_key);
+            sig = zi_fnv(sig, &flip_h_key, sizeof flip_h_key);
+            sig = zi_fnv(sig, &flip_v_key, sizeof flip_v_key);
+            sig = zi_fnv(sig, &orient_key, sizeof orient_key);
+            sig = zi_fnv(sig, &from_turns, sizeof from_turns);
+            sig = zi_fnv(sig, &from_flip_h, sizeof from_flip_h);
+            sig = zi_fnv(sig, &from_flip_v, sizeof from_flip_v);
             sig = zi_fnv(sig, op->model, strlen(op->model));
             sig = zi_fnv(sig, op->mask->bytes, (size_t)op->mask->w * (size_t)op->mask->h);
             zi_touch_lock();
@@ -2481,14 +3471,26 @@ void zi_touch_apply(float *rgb, int w, int h, const ZiTouchDoc *doc) {
             zi_touch_unlock();
         }
         if (!repaired) {
-            scaled = zi_mask_scaled(op->mask->bytes, op->mask->w, op->mask->h, w, h);
+            if (orient_key && (from_turns != turn_key || from_flip_h != flip_h_key || from_flip_v != flip_v_key)) {
+                scaled = zi_mask_reorient(op->mask->bytes, op->mask->w, op->mask->h, from_turns, from_flip_h,
+                                          from_flip_v, turn_key, flip_h_key, flip_v_key, &mask_w, &mask_h);
+                if (scaled && (mask_w != w || mask_h != h)) {
+                    free(scaled);
+                    scaled = NULL;
+                }
+            } else {
+                scaled = zi_mask_scaled(op->mask->bytes, op->mask->w, op->mask->h, w, h);
+            }
             if (!scaled) {
                 hashed = 0;
                 chain = 14695981039346656037ull;
                 continue;
             }
-            scratch = strcmp(op->model, ZI_TOUCH_SCRATCH) == 0;
-            repaired = zi_repair(rgb, scaled, w, h, scratch);
+            if (redeye) {
+                repaired = zi_correct_redeye(rgb, scaled, w, h);
+            } else {
+                repaired = zi_repair(rgb, scaled, w, h, scratch);
+            }
             free(scaled);
             if (!repaired) {
                 hashed = 0;

@@ -124,6 +124,14 @@ static void zi_clear_tone_fields(ZiTone *tone) {
     tone->spectrum_low = 0;
     tone->spectrum_mid = 0.5;
     tone->spectrum_high = 1;
+    tone->details = 0;
+    tone->vignette_amount = 0;
+    tone->vignette_round = 0;
+    tone->vignette_x = 0;
+    tone->vignette_y = 0;
+    tone->vignette_mid = 0.5;
+    tone->vignette_feather = 0.5;
+    zi_curves_identity(&tone->curves);
 }
 
 static void zi_clear_geo_fields(ZiTone *tone) {
@@ -139,6 +147,10 @@ static void zi_clear_geo_fields(ZiTone *tone) {
     memset(tone->corner_x, 0, sizeof tone->corner_x);
     memset(tone->corner_y, 0, sizeof tone->corner_y);
     tone->turns = 0;
+    tone->offset_x = 0;
+    tone->offset_y = 0;
+    tone->flip_h = 0;
+    tone->flip_v = 0;
 }
 
 static int zi_tone_part(const ZiTone *a, const ZiTone *b) {
@@ -152,7 +164,11 @@ static int zi_tone_part(const ZiTone *a, const ZiTone *b) {
            zi_close(a->spectrum_low, b->spectrum_low) && zi_close(a->spectrum_mid, b->spectrum_mid) &&
            zi_close(a->spectrum_high, b->spectrum_high) && a->has_skin == b->has_skin &&
            (!a->has_skin || (a->skin_preset == b->skin_preset && zi_close(a->skin_delta_a, b->skin_delta_a) &&
-                             zi_close(a->skin_delta_b, b->skin_delta_b)));
+                             zi_close(a->skin_delta_b, b->skin_delta_b))) &&
+           zi_close(a->details, b->details) && zi_close(a->vignette_amount, b->vignette_amount) &&
+           zi_close(a->vignette_mid, b->vignette_mid) && zi_close(a->vignette_round, b->vignette_round) &&
+           zi_close(a->vignette_feather, b->vignette_feather) && zi_close(a->vignette_x, b->vignette_x) &&
+           zi_close(a->vignette_y, b->vignette_y) && zi_curves_same(&a->curves, &b->curves);
 }
 
 static int zi_geo_part(const ZiTone *a, const ZiTone *b) {
@@ -161,7 +177,9 @@ static int zi_geo_part(const ZiTone *a, const ZiTone *b) {
     if (!zi_close(a->straighten, b->straighten) || !zi_close(a->vertical, b->vertical) ||
         !zi_close(a->horizontal, b->horizontal) || !zi_close(a->sharpness, b->sharpness) ||
         !zi_close(a->k1, b->k1) || !zi_close(a->k2, b->k2) || !zi_close(a->fov, b->fov) ||
-        a->lens != b->lens || a->has_corners != b->has_corners || (a->turns & 3) != (b->turns & 3)) {
+        !zi_close(a->offset_x, b->offset_x) || !zi_close(a->offset_y, b->offset_y) ||
+        a->flip_h != b->flip_h || a->flip_v != b->flip_v || a->lens != b->lens ||
+        a->has_corners != b->has_corners || (a->turns & 3) != (b->turns & 3)) {
         return 0;
     }
     if (!a->has_corners) {
@@ -332,6 +350,45 @@ static void buf_point(ZiBuf *buf, double x, double y) {
     buf_raw(buf, "}");
 }
 
+static void buf_bool(ZiBuf *buf, int value) {
+    buf_raw(buf, value ? "true" : "false");
+}
+
+static void buf_curve(ZiBuf *buf, const ZiCurve *curve) {
+    int i;
+    int count = 0;
+
+    if (curve && curve->count > 0) {
+        count = curve->count;
+        if (count > ZI_CURVE_MAX) {
+            count = ZI_CURVE_MAX;
+        }
+    }
+    buf_raw(buf, "{\"points\":[");
+    for (i = 0; i < count; i++) {
+        if (i) {
+            buf_raw(buf, ",");
+        }
+        buf_point(buf, curve->points[i].x, curve->points[i].y);
+    }
+    buf_raw(buf, "]}");
+}
+
+static void buf_curves(ZiBuf *buf, const ZiCurves *curves) {
+    int first = 1;
+
+    buf_raw(buf, "{");
+    buf_key(buf, &first, "blue");
+    buf_curve(buf, curves ? &curves->blue : NULL);
+    buf_key(buf, &first, "green");
+    buf_curve(buf, curves ? &curves->green : NULL);
+    buf_key(buf, &first, "master");
+    buf_curve(buf, curves ? &curves->master : NULL);
+    buf_key(buf, &first, "red");
+    buf_curve(buf, curves ? &curves->red : NULL);
+    buf_raw(buf, "}");
+}
+
 static void buf_tone_body(ZiBuf *buf, const ZiTone *tone) {
     int first = 1;
 
@@ -344,8 +401,12 @@ static void buf_tone_body(ZiBuf *buf, const ZiTone *tone) {
     buf_num(buf, tone->clarity);
     buf_key(buf, &first, "contrast");
     buf_num(buf, tone->contrast);
+    buf_key(buf, &first, "curves");
+    buf_curves(buf, &tone->curves);
     buf_key(buf, &first, "dehaze");
     buf_num(buf, tone->dehaze);
+    buf_key(buf, &first, "details");
+    buf_num(buf, tone->details);
     buf_key(buf, &first, "exposureEV");
     buf_num(buf, tone->exposure);
     buf_key(buf, &first, "highlights");
@@ -400,6 +461,18 @@ static void buf_tone_body(ZiBuf *buf, const ZiTone *tone) {
     buf_num(buf, tone->tint);
     buf_key(buf, &first, "vibrance");
     buf_num(buf, tone->vibrance);
+    buf_key(buf, &first, "vignetteAmount");
+    buf_num(buf, tone->vignette_amount);
+    buf_key(buf, &first, "vignetteCenterX");
+    buf_num(buf, tone->vignette_x);
+    buf_key(buf, &first, "vignetteCenterY");
+    buf_num(buf, tone->vignette_y);
+    buf_key(buf, &first, "vignetteFeather");
+    buf_num(buf, tone->vignette_feather);
+    buf_key(buf, &first, "vignetteMidpoint");
+    buf_num(buf, tone->vignette_mid);
+    buf_key(buf, &first, "vignetteRoundness");
+    buf_num(buf, tone->vignette_round);
     buf_key(buf, &first, "whites");
     buf_num(buf, tone->whites);
     buf_raw(buf, "}");
@@ -442,10 +515,18 @@ static void buf_geometry(ZiBuf *buf, const ZiTone *tone) {
         buf_point(buf, tone->corner_x[1], tone->corner_y[1]);
         buf_raw(buf, "}");
     }
+    buf_key(buf, &first, "flipHorizontal");
+    buf_bool(buf, tone->flip_h);
+    buf_key(buf, &first, "flipVertical");
+    buf_bool(buf, tone->flip_v);
     buf_key(buf, &first, "horizontalKeystone");
     buf_num(buf, tone->horizontal);
     buf_key(buf, &first, "lens");
     buf_lens(buf, tone);
+    buf_key(buf, &first, "offsetX");
+    buf_num(buf, tone->offset_x);
+    buf_key(buf, &first, "offsetY");
+    buf_num(buf, tone->offset_y);
     buf_key(buf, &first, "quarterTurns");
     sprintf_s(turns, sizeof turns, "%d", tone->turns & 3);
     buf_raw(buf, turns);
@@ -474,11 +555,18 @@ static void buf_inpaint(ZiBuf *buf, const ZiTouchOp *op) {
     unsigned char *png = NULL;
     size_t png_len = 0;
     char *b64 = NULL;
+    char turns[16];
 
     buf_raw(buf, "{\"featherPx\":");
     buf_num(buf, op->feather);
     buf_raw(buf, ",\"id\":");
     buf_json(buf, op->id);
+    if (op->has_orient) {
+        buf_raw(buf, ",\"maskFlipHorizontal\":");
+        buf_bool(buf, op->mask_flip_h);
+        buf_raw(buf, ",\"maskFlipVertical\":");
+        buf_bool(buf, op->mask_flip_v);
+    }
     buf_raw(buf, ",\"maskPNG\":");
     if (op->mask && zi_touch_mask_png(op->mask, &png, &png_len)) {
         b64 = zi_touch_base64(png, png_len);
@@ -486,6 +574,11 @@ static void buf_inpaint(ZiBuf *buf, const ZiTouchOp *op) {
     free(png);
     buf_json(buf, b64 ? b64 : "");
     free(b64);
+    if (op->has_orient) {
+        buf_raw(buf, ",\"maskQuarterTurns\":");
+        sprintf_s(turns, sizeof turns, "%d", op->mask_turns);
+        buf_raw(buf, turns);
+    }
     buf_raw(buf, ",\"modelID\":");
     buf_json(buf, op->model);
     buf_raw(buf, ",\"strength\":");
@@ -909,6 +1002,59 @@ static int js_double(ZiJs *js, double *out) {
     return 1;
 }
 
+static int js_ident_end(const ZiJs *js, const char *p) {
+    unsigned char c;
+
+    if (p >= js->end) {
+        return 1;
+    }
+    c = (unsigned char)*p;
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+        return 0;
+    }
+    return 1;
+}
+
+static int js_number_here(const ZiJs *js) {
+    const char *p = js->p;
+
+    if (p < js->end && (*p == '-' || *p == '+')) {
+        p++;
+    }
+    return p < js->end && *p >= '0' && *p <= '9';
+}
+
+/* true/false, or a number that is exactly 0 or 1. Failure leaves the cursor unmoved and js->err unchanged. */
+static int js_bool(ZiJs *js, int *out) {
+    const char *mark;
+    int saved;
+    double value = 0;
+
+    js_ws(js);
+    if (js->p + 4 <= js->end && memcmp(js->p, "true", 4) == 0 && js_ident_end(js, js->p + 4)) {
+        js->p += 4;
+        *out = 1;
+        return 1;
+    }
+    if (js->p + 5 <= js->end && memcmp(js->p, "false", 5) == 0 && js_ident_end(js, js->p + 5)) {
+        js->p += 5;
+        *out = 0;
+        return 1;
+    }
+    if (!js_number_here(js)) {
+        return 0;
+    }
+    mark = js->p;
+    saved = js->err;
+    if (!js_double(js, &value) || (value != 0.0 && value != 1.0)) {
+        js->p = mark;
+        js->err = saved;
+        return 0;
+    }
+    *out = value == 1.0;
+    return 1;
+}
+
 static int js_skip(ZiJs *js, int depth) {
     js_ws(js);
     if (depth > 32 || js->p >= js->end) {
@@ -988,6 +1134,88 @@ static int js_point(ZiJs *js, double *x, double *y) {
             *x = value;
         } else if (strcmp(key, "y") == 0) {
             *y = value;
+        }
+    }
+    return !js->err;
+}
+
+static int js_curve(ZiJs *js, ZiCurve *curve) {
+    int first = 1;
+    char key[16];
+
+    zi_curve_linear(curve);
+    if (js_null(js)) {
+        return 1;
+    }
+    if (!js_eat(js, '{')) {
+        return 0;
+    }
+    while (js_key(js, &first, key, sizeof key)) {
+        if (strcmp(key, "points") == 0) {
+            int item = 1;
+            int count = 0;
+
+            if (js_null(js)) {
+                zi_curve_linear(curve);
+                continue;
+            }
+            if (!js_eat(js, '[')) {
+                return 0;
+            }
+            while (js_item(js, &item)) {
+                double x = 0;
+                double y = 0;
+
+                if (!js_point(js, &x, &y)) {
+                    return 0;
+                }
+                if (count < ZI_CURVE_MAX) {
+                    curve->points[count].x = x;
+                    curve->points[count].y = y;
+                    count++;
+                }
+            }
+            if (js->err) {
+                return 0;
+            }
+            curve->count = count;
+            zi_curve_sanitize(curve);
+        } else if (!js_skip(js, 1)) {
+            return 0;
+        }
+    }
+    return !js->err;
+}
+
+static int js_curves(ZiJs *js, ZiCurves *curves) {
+    int first = 1;
+    char key[16];
+
+    zi_curves_identity(curves);
+    if (js_null(js)) {
+        return 1;
+    }
+    if (!js_eat(js, '{')) {
+        return 0;
+    }
+    while (js_key(js, &first, key, sizeof key)) {
+        ZiCurve *channel = NULL;
+
+        if (strcmp(key, "blue") == 0) {
+            channel = &curves->blue;
+        } else if (strcmp(key, "green") == 0) {
+            channel = &curves->green;
+        } else if (strcmp(key, "master") == 0) {
+            channel = &curves->master;
+        } else if (strcmp(key, "red") == 0) {
+            channel = &curves->red;
+        }
+        if (channel) {
+            if (!js_curve(js, channel)) {
+                return 0;
+            }
+        } else if (!js_skip(js, 1)) {
+            return 0;
         }
     }
     return !js->err;
@@ -1091,6 +1319,12 @@ static int js_tone(ZiJs *js, ZiTone *tone) {
             tone->skin_delta_b = have_b ? delta_b : target_b - sample_b;
             continue;
         }
+        if (strcmp(key, "curves") == 0) {
+            if (!js_curves(js, &tone->curves)) {
+                return 0;
+            }
+            continue;
+        }
         if (js_null(js)) {
             continue;
         }
@@ -1117,6 +1351,8 @@ static int js_tone(ZiJs *js, ZiTone *tone) {
             tone->clarity = value;
         } else if (strcmp(key, "dehaze") == 0) {
             tone->dehaze = value;
+        } else if (strcmp(key, "details") == 0) {
+            tone->details = value;
         } else if (strcmp(key, "vibrance") == 0) {
             tone->vibrance = value;
         } else if (strcmp(key, "saturation") == 0) {
@@ -1131,6 +1367,18 @@ static int js_tone(ZiJs *js, ZiTone *tone) {
             tone->spectrum_mid = value;
         } else if (strcmp(key, "spectrumHigh") == 0) {
             tone->spectrum_high = value;
+        } else if (strcmp(key, "vignetteAmount") == 0) {
+            tone->vignette_amount = value;
+        } else if (strcmp(key, "vignetteCenterX") == 0) {
+            tone->vignette_x = value;
+        } else if (strcmp(key, "vignetteCenterY") == 0) {
+            tone->vignette_y = value;
+        } else if (strcmp(key, "vignetteFeather") == 0) {
+            tone->vignette_feather = value;
+        } else if (strcmp(key, "vignetteMidpoint") == 0) {
+            tone->vignette_mid = value;
+        } else if (strcmp(key, "vignetteRoundness") == 0) {
+            tone->vignette_round = value;
         }
     }
     return !js->err;
@@ -1229,6 +1477,28 @@ static int js_geometry(ZiJs *js, ZiTone *tone) {
             if (js->err) {
                 return 0;
             }
+        } else if (strcmp(key, "flipHorizontal") == 0) {
+            int flag = 0;
+
+            if (js_null(js)) {
+                continue;
+            }
+            if (!js_bool(js, &flag)) {
+                js->err = 1;
+                return 0;
+            }
+            tone->flip_h = flag;
+        } else if (strcmp(key, "flipVertical") == 0) {
+            int flag = 0;
+
+            if (js_null(js)) {
+                continue;
+            }
+            if (!js_bool(js, &flag)) {
+                js->err = 1;
+                return 0;
+            }
+            tone->flip_v = flag;
         } else if (js_null(js)) {
             continue;
         } else {
@@ -1252,6 +1522,10 @@ static int js_geometry(ZiJs *js, ZiTone *tone) {
                 tone->horizontal = value;
             } else if (strcmp(key, "sharpness") == 0) {
                 tone->sharpness = value;
+            } else if (strcmp(key, "offsetX") == 0) {
+                tone->offset_x = value;
+            } else if (strcmp(key, "offsetY") == 0) {
+                tone->offset_y = value;
             }
         }
     }
@@ -1439,6 +1713,44 @@ static int js_inpaint_op(ZiJs *js, ZiTouchOp *op, int *have) {
             if (!png_text) {
                 return 0;
             }
+        } else if (strcmp(key, "maskQuarterTurns") == 0) {
+            double turns = 0;
+
+            op->has_orient = 1;
+            if (js_null(js)) {
+                continue;
+            }
+            if (!js_double(js, &turns)) {
+                free(png_text);
+                return 0;
+            }
+            op->mask_turns = (int)turns;
+        } else if (strcmp(key, "maskFlipHorizontal") == 0) {
+            int flag = 0;
+
+            op->has_orient = 1;
+            if (js_null(js)) {
+                continue;
+            }
+            if (!js_bool(js, &flag)) {
+                free(png_text);
+                js->err = 1;
+                return 0;
+            }
+            op->mask_flip_h = flag;
+        } else if (strcmp(key, "maskFlipVertical") == 0) {
+            int flag = 0;
+
+            op->has_orient = 1;
+            if (js_null(js)) {
+                continue;
+            }
+            if (!js_bool(js, &flag)) {
+                free(png_text);
+                js->err = 1;
+                return 0;
+            }
+            op->mask_flip_v = flag;
         } else if (!js_skip(js, 1)) {
             free(png_text);
             return 0;
@@ -1680,6 +1992,10 @@ static int js_apply_command(ZiJs *js, ZiTone *tone, ZiTouchDoc *doc, wchar_t *la
                 memcpy(tone->corner_x, part.corner_x, sizeof tone->corner_x);
                 memcpy(tone->corner_y, part.corner_y, sizeof tone->corner_y);
                 tone->turns = part.turns;
+                tone->offset_x = part.offset_x;
+                tone->offset_y = part.offset_y;
+                tone->flip_h = part.flip_h;
+                tone->flip_v = part.flip_v;
             } else {
                 zi_clear_tone_fields(tone);
                 tone->exposure = part.exposure;
@@ -1703,6 +2019,14 @@ static int js_apply_command(ZiJs *js, ZiTone *tone, ZiTouchDoc *doc, wchar_t *la
                 tone->spectrum_low = part.spectrum_low;
                 tone->spectrum_mid = part.spectrum_mid;
                 tone->spectrum_high = part.spectrum_high;
+                tone->details = part.details;
+                tone->vignette_amount = part.vignette_amount;
+                tone->vignette_mid = part.vignette_mid;
+                tone->vignette_round = part.vignette_round;
+                tone->vignette_feather = part.vignette_feather;
+                tone->vignette_x = part.vignette_x;
+                tone->vignette_y = part.vignette_y;
+                tone->curves = part.curves;
             }
         } else if (strcmp(key, "setCrop") == 0) {
             if (!js_crop(js, tone)) {
